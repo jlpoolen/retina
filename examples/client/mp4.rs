@@ -565,7 +565,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         .play(
             retina::client::PlayPolicy::default()
                 .initial_timestamp(opts.initial_timestamp)
-                .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(10).unwrap()),
+                .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(30).unwrap()),
         )
         .await?
         .demuxed()?;

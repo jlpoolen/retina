@@ -24,7 +24,14 @@ To monitor what's running:
 use strict;
 use warnings;
 
-use File::Path;
+use File::Path qw(make_path);
+use POSIX qw(strftime);
+
+my @time = localtime;
+#
+# alter environment, which will be inherited by forked processes
+#
+$ENV{RUST_BACKTRACE} = 1; # 1 = activate backtracing
 
 my $retina_root_dir = '/usr/local/src/retina';
 
@@ -41,10 +48,24 @@ my $user     = "retina";
 my $password = "testingisfun";
 #
 # The working area
+# Caution: root access required for directory making under /tmp, so
+# below may not work and you have to manually create the first level subdirectory workspace as root
+# or with sudo
+#   mkdir /tmp/retina
+#   chmod 777 /tmp/retina
+# of (risky):
+#   chmod 777 /tmp  [then this script will be able to create /tmp/retina]
+#
+#
+# have a subdirectory for each run to keep some sort of organization
 #
 my $out_dir = "/tmp/retina";
-mkdir -p $out_dir unless -d $out_dir;
-chmod 0777, $out_dir;
+my $run_stamp = strftime('%b_%d_%H_%M_%S', @time);
+$out_dir .= "/$run_stamp";
+print "working directory = $out_dir\n";
+make_path($out_dir,{chmod => 0777,}) unless -d $out_dir;
+
+
 
 while (my $data = <DATA>){
     chomp $data;
@@ -53,7 +74,7 @@ while (my $data = <DATA>){
     &create_test($camera_type,$camera,$ip);
 }
 
-
+print "\nUse this to monitor:\n ps -efww |grep mp4\n";
 #
 # ------------------------ subs ----------------------
 #
@@ -65,11 +86,13 @@ sub create_test {
     $camera =~ s/\s/_/g;  # replace white spaces
     my $timestamp = `date +%Y%m%d_%H%M%S`;
     chomp $timestamp;
-    my $log = "$out_dir/$camera\_$timestamp\.log";
-    my $output = "$out_dir/$camera\_$timestamp\.mp4";
+    my $base_name = "$out_dir/$camera\_$timestamp";
+    my $log     = "$base_name\.log";
+    my $err_log = "$base_name\_err.log";
+    my $output  = "$base_name\.mp4";
     
     my $rc = &start_stream($camera_model,$camera,
-			   $ip,$user,$password,$output,$log);
+			   $ip,$user,$password,$output,$log,$err_log);
     print "rc = $rc\n";
     
     print "Commenced $camera, output in $out_dir\n\n";
@@ -77,7 +100,7 @@ sub create_test {
 
 
 sub start_stream {
-    my ($camera_model,$camera, $ip, $user, $password, $mp4_output, $log) = @_;
+    my ($camera_model,$camera, $ip, $user, $password, $mp4_output, $log, $err_log) = @_;
    
     my $url;
     #
@@ -89,12 +112,21 @@ sub start_stream {
     } else {
 	die "Unknown camera type/model: $camera_model";
     }
-    
-    my $cmd = qq{cargo run --example client mp4 $mp4_output --url $url --username $user --password $password  >$log  2>&1 &};
+    #
+    # Initialize each log with a date time stamp
+    # add a sleep after echo and before call cargo as cargo complains:
+    #    Blocking waiting for file lock on package cache
+    #
+    # Note: cargo does not like backslashes
+    #
+    my $cmd = qq{ echo Commenced $camera `date` >$err_log; \
+echo Commenced $camera `date` >$log; \
+sleep 1; \
+cargo run --example client mp4 $mp4_output --url $url --username $user --password $password  >>$log  2>>$err_log &};
     #
     # we'll fork since we're logging
     #
-    print "About to launch:\n$cmd\n";
+    print "Launching:\n$cmd\n";
     system($cmd);
     return 1
 }
