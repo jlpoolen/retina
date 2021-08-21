@@ -17,8 +17,8 @@
 //! https://github.com/scottlamb/moonfire-nvr/wiki/Standards-and-specifications
 //! https://standards.iso.org/ittf/PubliclyAvailableStandards/c068960_ISO_IEC_14496-12_2015.zip
 
+use anyhow::{anyhow, bail, Error};
 use bytes::{Buf, BufMut, BytesMut};
-use failure::{bail, format_err, Error};
 use futures::StreamExt;
 use log::info;
 use retina::codec::{AudioParameters, CodecItem, VideoParameters};
@@ -42,6 +42,9 @@ pub struct Opts {
 
     #[structopt(long)]
     no_audio: bool,
+
+    #[structopt(long)]
+    ignore_spurious_data: bool,
 
     #[structopt(parse(try_from_str))]
     out: PathBuf,
@@ -80,8 +83,8 @@ async fn write_all_buf<W: AsyncWrite + Unpin, B: Buf>(
 pub struct Mp4Writer<W: AsyncWrite + AsyncSeek + Send + Unpin> {
     mdat_start: u32,
     mdat_pos: u32,
-    video_params: Option<VideoParameters>,
-    audio_params: Option<AudioParameters>,
+    video_params: Option<Box<VideoParameters>>,
+    audio_params: Option<Box<AudioParameters>>,
 
     /// The (1-indexed) video sample (frame) number of each sync sample (random access point).
     video_sync_sample_nums: Vec<u32>,
@@ -165,14 +168,14 @@ impl TrakTracker {
             buf.put_u32(u32::try_from(self.chunks.len())?);
             let mut prev_sample_number = 1;
             let mut chunk_number = 1;
-            for &(sample_number, _pos) in &self.chunks[1..] {
-                buf.put_u32(chunk_number);
-                buf.put_u32(sample_number - prev_sample_number);
-                buf.put_u32(1); // sample_description_index
-                prev_sample_number = sample_number;
-                chunk_number += 1;
-            }
             if !self.chunks.is_empty() {
+                for &(sample_number, _pos) in &self.chunks[1..] {
+                    buf.put_u32(chunk_number);
+                    buf.put_u32(sample_number - prev_sample_number);
+                    buf.put_u32(1); // sample_description_index
+                    prev_sample_number = sample_number;
+                    chunk_number += 1;
+                }
                 buf.put_u32(chunk_number);
                 buf.put_u32(self.samples + 1 - prev_sample_number);
                 buf.put_u32(1); // sample_description_index
@@ -199,8 +202,8 @@ impl TrakTracker {
 
 impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
     pub async fn new(
-        video_params: Option<VideoParameters>,
-        audio_params: Option<AudioParameters>,
+        video_params: Option<Box<VideoParameters>>,
+        audio_params: Option<Box<AudioParameters>>,
         mut inner: W,
     ) -> Result<Self, Error> {
         let mut buf = BytesMut::new();
@@ -294,7 +297,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                 let dims = self
                     .video_params
                     .as_ref()
-                    .map(VideoParameters::pixel_dimensions)
+                    .map(|p| p.pixel_dimensions())
                     .unwrap_or((0, 0));
                 let width = u32::from(u16::try_from(dims.0)?) << 16;
                 let height = u32::from(u16::try_from(dims.1)?) << 16;
@@ -485,31 +488,35 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         Ok(())
     }
 
-    async fn video(&mut self, mut frame: retina::codec::VideoFrame) -> Result<(), failure::Error> {
+    async fn video(&mut self, mut frame: retina::codec::VideoFrame) -> Result<(), Error> {
         println!(
             "{}: {}-byte video frame",
             &frame.timestamp,
-            frame.remaining()
+            frame.data().remaining(),
         );
-        if let Some(ref p) = frame.new_parameters {
-            bail!("parameters change unimplemented. new parameters: {:#?}", p);
+        if let Some(p) = frame.new_parameters.take() {
+            if self.video_trak.samples > 0 {
+                bail!("parameters change unimplemented. new parameters: {:#?}", p);
+            }
+            self.video_params = Some(p);
         }
-        let size = u32::try_from(frame.remaining())?;
+        let size = u32::try_from(frame.data().remaining())?;
         self.video_trak
             .add_sample(self.mdat_pos, size, frame.timestamp, frame.loss)?;
         self.mdat_pos = self
             .mdat_pos
             .checked_add(size)
-            .ok_or_else(|| format_err!("mdat_pos overflow"))?;
+            .ok_or_else(|| anyhow!("mdat_pos overflow"))?;
         if frame.is_random_access_point {
             self.video_sync_sample_nums
                 .push(u32::try_from(self.video_trak.samples)?);
         }
-        write_all_buf(&mut self.inner, &mut frame).await?;
+        let mut data = frame.into_data();
+        write_all_buf(&mut self.inner, &mut data).await?;
         Ok(())
     }
 
-    async fn audio(&mut self, mut frame: retina::codec::AudioFrame) -> Result<(), failure::Error> {
+    async fn audio(&mut self, mut frame: retina::codec::AudioFrame) -> Result<(), Error> {
         println!(
             "{}: {}-byte audio frame",
             &frame.timestamp,
@@ -521,7 +528,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
         self.mdat_pos = self
             .mdat_pos
             .checked_add(size)
-            .ok_or_else(|| format_err!("mdat_pos overflow"))?;
+            .ok_or_else(|| anyhow!("mdat_pos overflow"))?;
         write_all_buf(&mut self.inner, &mut frame.data).await?;
         Ok(())
     }
@@ -530,7 +537,14 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
 pub async fn run(opts: Opts) -> Result<(), Error> {
     let creds = super::creds(opts.src.username, opts.src.password);
     let stop = tokio::signal::ctrl_c();
-    let mut session = retina::client::Session::describe(opts.src.url, creds).await?;
+    let mut session = retina::client::Session::describe(
+        opts.src.url,
+        retina::client::SessionOptions::default()
+            .creds(creds)
+            .user_agent("Retina mp4 example".to_owned())
+            .ignore_spurious_data(opts.ignore_spurious_data),
+    )
+    .await?;
     let video_stream = if !opts.no_video {
         session
             .streams()
@@ -563,7 +577,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     }
     let session = session
         .play(
-            retina::client::PlayPolicy::default()
+            retina::client::PlayOptions::default()
                 .initial_timestamp(opts.initial_timestamp)
                 .enforce_timestamps_with_max_jump_secs(NonZeroU32::new(30).unwrap()),
         )
@@ -573,8 +587,8 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     // Read RTP data.
     let out = tokio::fs::File::create(opts.out).await?;
     let mut mp4 = Mp4Writer::new(
-        video_stream.map(|(_, p)| p),
-        audio_stream.map(|(_, p)| p),
+        video_stream.map(|(_, p)| Box::new(p)),
+        audio_stream.map(|(_, p)| Box::new(p)),
         out,
     )
     .await?;
@@ -584,9 +598,12 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     loop {
         tokio::select! {
             pkt = session.next() => {
-                match pkt.ok_or_else(|| format_err!("EOF"))?? {
+                match pkt.ok_or_else(|| anyhow!("EOF"))?? {
                     CodecItem::VideoFrame(f) => mp4.video(f).await?,
                     CodecItem::AudioFrame(f) => mp4.audio(f).await?,
+                    CodecItem::SenderReport(sr) => {
+                        println!("{}: SR ts={}", sr.timestamp, sr.ntp_timestamp);
+                    },
                     _ => continue,
                 };
             },

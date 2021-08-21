@@ -7,14 +7,12 @@
 use std::num::NonZeroU32;
 
 use bytes::Bytes;
-use failure::format_err;
-use failure::Error;
 
 use super::CodecItem;
 
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
-    parameters: super::Parameters,
+    clock_rate: u32,
     pending: Option<super::AudioFrame>,
     bits_per_sample: u32,
 }
@@ -23,20 +21,20 @@ impl Depacketizer {
     /// Creates a new Depacketizer.
     pub(super) fn new(clock_rate: u32, bits_per_sample: u32) -> Self {
         Self {
-            parameters: super::Parameters::Audio(super::AudioParameters {
-                rfc6381_codec: None,
-                frame_length: None, // variable
-                clock_rate,
-                extra_data: Bytes::new(),
-                config: super::AudioCodecConfig::Other,
-            }),
+            clock_rate,
             bits_per_sample,
             pending: None,
         }
     }
 
-    pub(super) fn parameters(&self) -> Option<&super::Parameters> {
-        Some(&self.parameters)
+    pub(super) fn parameters(&self) -> Option<super::Parameters> {
+        Some(super::Parameters::Audio(super::AudioParameters {
+            rfc6381_codec: None,
+            frame_length: None, // variable
+            clock_rate: self.clock_rate,
+            extra_data: Bytes::new(),
+            sample_entry: None,
+        }))
     }
 
     fn frame_length(&self, payload_len: usize) -> Option<NonZeroU32> {
@@ -50,10 +48,10 @@ impl Depacketizer {
         }
     }
 
-    pub(super) fn push(&mut self, pkt: crate::client::rtp::Packet) -> Result<(), Error> {
+    pub(super) fn push(&mut self, pkt: crate::client::rtp::Packet) -> Result<(), String> {
         assert!(self.pending.is_none());
         let frame_length = self.frame_length(pkt.payload.len()).ok_or_else(|| {
-            format_err!(
+            format!(
                 "invalid length {} for payload of {}-bit audio samples",
                 pkt.payload.len(),
                 self.bits_per_sample
@@ -61,7 +59,7 @@ impl Depacketizer {
         })?;
         self.pending = Some(super::AudioFrame {
             loss: pkt.loss,
-            ctx: pkt.rtsp_ctx,
+            ctx: pkt.ctx,
             stream_id: pkt.stream_id,
             timestamp: pkt.timestamp,
             frame_length,
@@ -70,7 +68,7 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(&mut self) -> Result<Option<super::CodecItem>, Error> {
-        Ok(self.pending.take().map(CodecItem::AudioFrame))
+    pub(super) fn pull(&mut self) -> Option<super::CodecItem> {
+        self.pending.take().map(CodecItem::AudioFrame)
     }
 }

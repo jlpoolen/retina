@@ -4,18 +4,19 @@
 //! RTP and RTCP handling; see [RFC 3550](https://datatracker.ietf.org/doc/html/rfc3550).
 
 use bytes::{Buf, Bytes};
-use failure::{bail, format_err, Error};
-use log::{debug, trace};
+use log::debug;
 use pretty_hex::PrettyHex;
 
 use crate::client::PacketItem;
+use crate::{Error, ErrorInt};
 
-/// An RTP packet.
-#[derive(Debug)]
+/// A received RTP packet.
 pub struct Packet {
-    pub rtsp_ctx: crate::Context,
+    pub ctx: crate::RtspMessageContext,
+    pub channel_id: u8,
     pub stream_id: usize,
     pub timestamp: crate::Timestamp,
+    pub ssrc: u32,
     pub sequence_number: u16,
 
     /// Number of skipped sequence numbers since the last packet.
@@ -23,7 +24,7 @@ pub struct Packet {
     /// In the case of the first packet on the stream, this may also report loss
     /// packets since the `RTP-Info` header's `seq` value. However, currently
     /// that header is not required to be present and may be ignored (see
-    /// [`crate::client::PlayPolicy::ignore_zero_seq()`].)
+    /// [`retina::client::PlayPolicy::ignore_zero_seq()`].)
     pub loss: u16,
 
     pub mark: bool,
@@ -32,17 +33,33 @@ pub struct Packet {
     pub payload: Bytes,
 }
 
+impl std::fmt::Debug for Packet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Packet")
+            .field("ctx", &self.ctx)
+            .field("channel_id", &self.channel_id)
+            .field("stream_id", &self.stream_id)
+            .field("timestamp", &self.timestamp)
+            .field("ssrc", &self.ssrc)
+            .field("sequence_number", &self.sequence_number)
+            .field("loss", &self.loss)
+            .field("mark", &self.mark)
+            .field("payload", &self.payload.hex_dump())
+            .finish()
+    }
+}
+
 /// An RTCP sender report.
 #[derive(Debug)]
 pub struct SenderReport {
     pub stream_id: usize,
-    pub rtsp_ctx: crate::Context,
+    pub ctx: crate::RtspMessageContext,
     pub timestamp: crate::Timestamp,
     pub ntp_timestamp: crate::NtpTimestamp,
 }
 
 /// RTP/RTCP demarshaller which ensures packets have the correct SSRC and
-/// monotonically increasing SEQ.
+/// monotonically increasing SEQ. Unstable; exposed for benchmark.
 ///
 /// This reports packet loss (via [Packet::loss]) but doesn't prohibit it, except for losses
 /// of more than `i16::MAX` which would be indistinguishable from non-monotonic sequence numbers.
@@ -56,24 +73,28 @@ pub struct SenderReport {
 /// [RFC 3550 section 8.2](https://tools.ietf.org/html/rfc3550#section-8.2) says that SSRC
 /// can change mid-session with a RTCP BYE message. This currently isn't handled. I'm
 /// not sure it will ever come up with IP cameras.
+#[doc(hidden)]
 #[derive(Debug)]
-pub(super) struct StrictSequenceChecker {
+pub struct StrictSequenceChecker {
     ssrc: Option<u32>,
     next_seq: Option<u16>,
 }
 
 impl StrictSequenceChecker {
-    pub(super) fn new(ssrc: Option<u32>, next_seq: Option<u16>) -> Self {
+    pub fn new(ssrc: Option<u32>, next_seq: Option<u16>) -> Self {
         Self { ssrc, next_seq }
     }
 
-    pub(super) fn rtp(
+    pub fn rtp(
         &mut self,
-        rtsp_ctx: crate::Context,
+        session_options: &super::SessionOptions,
+        conn_ctx: &crate::ConnectionContext,
+        msg_ctx: &crate::RtspMessageContext,
         timeline: &mut super::Timeline,
+        channel_id: u8,
         stream_id: usize,
         mut data: Bytes,
-    ) -> Result<PacketItem, Error> {
+    ) -> Result<Option<PacketItem>, Error> {
         // Terrible hack to try to make sense of the GW Security GW4089IP's audio stream.
         // It appears to have one RTSP interleaved message wrapped in another. RTP and RTCP
         // packets can never start with '$', so this shouldn't interfere with well-behaved
@@ -88,126 +109,157 @@ impl StrictSequenceChecker {
         }
 
         let reader = rtp_rs::RtpReader::new(&data[..]).map_err(|e| {
-            format_err!(
-                "corrupt RTP header while expecting seq={:04x?} at {:#?}: {:?}\n{:#?}",
-                self.next_seq,
-                &rtsp_ctx,
-                e,
-                data.hex_dump()
-            )
+            wrap!(ErrorInt::RtspDataMessageError {
+                conn_ctx: *conn_ctx,
+                msg_ctx: *msg_ctx,
+                channel_id,
+                stream_id,
+                description: format!(
+                    "corrupt RTP header while expecting seq={:04x?}: {:?}\n{:#?}",
+                    &self.next_seq,
+                    e,
+                    data.hex_dump(),
+                ),
+            })
         })?;
         let sequence_number = u16::from_be_bytes([data[2], data[3]]); // I don't like rtsp_rs::Seq.
-        let timestamp = match timeline.advance_to(reader.timestamp()) {
-            Ok(ts) => ts,
-            Err(e) => {
-                return Err(e
-                    .context(format!(
-                        "timestamp error in stream {} seq={:04x} {:#?}",
-                        stream_id, sequence_number, &rtsp_ctx
-                    ))
-                    .into())
-            }
-        };
         let ssrc = reader.ssrc();
         let loss = sequence_number.wrapping_sub(self.next_seq.unwrap_or(sequence_number));
-        if matches!(self.ssrc, Some(s) if s != ssrc) || loss > 0x80_00 {
-            bail!(
-                "Expected ssrc={:08x?} seq={:04x?} got ssrc={:08x} seq={:04x} ts={} at {:#?}",
-                self.ssrc,
-                self.next_seq,
+        if matches!(self.ssrc, Some(s) if s != ssrc) {
+            if session_options.ignore_spurious_data {
+                log::debug!(
+                    "Ignoring spurious RTP data with ssrc={:08x} seq={:04x} while expecting \
+                             ssrc={:08x?} seq={:04x?}",
+                    ssrc,
+                    sequence_number,
+                    self.ssrc,
+                    self.next_seq
+                );
+                return Ok(None);
+            } else {
+                bail!(ErrorInt::RtpPacketError {
+                    conn_ctx: *conn_ctx,
+                    msg_ctx: *msg_ctx,
+                    channel_id,
+                    stream_id,
+                    ssrc,
+                    sequence_number,
+                    description: format!(
+                        "Wrong ssrc; expecting ssrc={:08x?} seq={:04x?}",
+                        self.ssrc, self.next_seq
+                    ),
+                });
+            }
+        }
+        if loss > 0x80_00 {
+            bail!(ErrorInt::RtpPacketError {
+                conn_ctx: *conn_ctx,
+                msg_ctx: *msg_ctx,
+                channel_id,
+                stream_id,
                 ssrc,
                 sequence_number,
-                timestamp,
-                &rtsp_ctx
-            );
+                description: format!(
+                    "Out-of-order packet or large loss; expecting ssrc={:08x?} seq={:04x?}",
+                    self.ssrc, self.next_seq
+                ),
+            });
         }
+        let timestamp = match timeline.advance_to(reader.timestamp()) {
+            Ok(ts) => ts,
+            Err(description) => bail!(ErrorInt::RtpPacketError {
+                conn_ctx: *conn_ctx,
+                msg_ctx: *msg_ctx,
+                channel_id,
+                stream_id,
+                ssrc,
+                sequence_number,
+                description,
+            }),
+        };
         self.ssrc = Some(ssrc);
         let mark = reader.mark();
-        let payload_range = crate::as_range(&data, reader.payload())
-            .ok_or_else(|| format_err!("empty payload at {:#?}", &rtsp_ctx))?;
-        trace!(
-            "{:?} pkt {:04x}{} ts={} len={}",
-            &rtsp_ctx,
-            sequence_number,
-            if mark { "   " } else { "(M)" },
-            &timestamp,
-            payload_range.len()
-        );
+        let payload_range = crate::as_range(&data, reader.payload()).ok_or_else(|| {
+            wrap!(ErrorInt::RtpPacketError {
+                conn_ctx: *conn_ctx,
+                msg_ctx: *msg_ctx,
+                channel_id,
+                stream_id,
+                ssrc,
+                sequence_number,
+                description: "empty payload".into(),
+            })
+        })?;
         data.truncate(payload_range.end);
         data.advance(payload_range.start);
         self.next_seq = Some(sequence_number.wrapping_add(1));
-        Ok(PacketItem::RtpPacket(Packet {
+        Ok(Some(PacketItem::RtpPacket(Packet {
+            ctx: *msg_ctx,
+            channel_id,
             stream_id,
-            rtsp_ctx,
             timestamp,
+            ssrc,
             sequence_number,
             loss,
             mark,
             payload: data,
-        }))
+        })))
     }
 
-    pub(super) fn rtcp(
+    pub fn rtcp(
         &mut self,
-        rtsp_ctx: crate::Context,
+        session_options: &super::SessionOptions,
+        msg_ctx: &crate::RtspMessageContext,
         timeline: &mut super::Timeline,
         stream_id: usize,
-        mut data: Bytes,
-    ) -> Result<Option<PacketItem>, Error> {
-        use rtcp::packet::Packet;
+        data: Bytes,
+    ) -> Result<Option<PacketItem>, String> {
         let mut sr = None;
         let mut i = 0;
+        let mut data = &data[..];
         while !data.is_empty() {
-            let h = match rtcp::header::Header::unmarshal(&data) {
-                Err(e) => bail!("corrupt RTCP header at {:#?}: {}", &rtsp_ctx, e),
-                Ok(h) => h,
-            };
-            let pkt_len = (usize::from(h.length) + 1) * 4;
-            if pkt_len > data.len() {
-                bail!(
-                    "rtcp pkt len {} vs remaining body len {} at {:#?}",
-                    pkt_len,
-                    data.len(),
-                    &rtsp_ctx
-                );
-            }
-            let pkt = data.split_to(pkt_len);
-            match h.packet_type {
-                rtcp::header::PacketType::SenderReport => {
+            let (pkt, rest) = crate::rtcp::Packet::parse(data)?;
+            data = rest;
+            match pkt {
+                crate::rtcp::Packet::SenderReport(pkt) => {
                     if i > 0 {
-                        bail!("RTCP SR must be first in packet");
+                        return Err("RTCP SR must be first in packet".into());
                     }
-                    let pkt = match rtcp::sender_report::SenderReport::unmarshal(&pkt) {
-                        Err(e) => bail!("corrupt RTCP SR at {:#?}: {}", &rtsp_ctx, e),
-                        Ok(p) => p,
-                    };
+                    let timestamp =
+                        timeline
+                            .place(pkt.rtp_timestamp())
+                            .map_err(|mut description| {
+                                description.push_str(" in RTCP SR");
+                                description
+                            })?;
 
-                    let timestamp = match timeline.place(pkt.rtp_time) {
-                        Ok(ts) => ts,
-                        Err(e) => {
-                            return Err(e
-                                .context(format!(
-                                    "bad RTP timestamp in RTCP SR {:#?} at {:#?}",
-                                    &pkt, &rtsp_ctx
-                                ))
-                                .into())
+                    let ssrc = pkt.ssrc();
+                    if matches!(self.ssrc, Some(s) if s != ssrc) {
+                        if session_options.ignore_spurious_data {
+                            log::debug!(
+                                "Ignoring spurious RTCP data with ssrc={:08x} while \
+                                         expecting ssrc={:08x?}",
+                                ssrc,
+                                self.ssrc
+                            );
+                            return Ok(None);
+                        } else {
+                            return Err(format!(
+                                "Expected ssrc={:08x?}, got RTCP SR ssrc={:08x}",
+                                self.ssrc, ssrc
+                            ));
                         }
-                    };
-
-                    // TODO: verify ssrc.
+                    }
+                    self.ssrc = Some(ssrc);
 
                     sr = Some(SenderReport {
                         stream_id,
-                        rtsp_ctx,
+                        ctx: *msg_ctx,
                         timestamp,
-                        ntp_timestamp: crate::NtpTimestamp(pkt.ntp_time),
+                        ntp_timestamp: pkt.ntp_timestamp(),
                     });
                 }
-                /*rtcp::header::PacketType::SourceDescription => {
-                    let pkt = rtcp::source_description::SourceDescription::unmarshal(&pkt)?;
-                    debug!("rtcp source description: {:#?}", &pkt);
-                },*/
-                _ => debug!("rtcp: {:?}", h.packet_type),
+                crate::rtcp::Packet::Unknown(pkt) => debug!("rtcp: {:?}", pkt.payload_type()),
             }
             i += 1;
         }

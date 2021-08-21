@@ -6,35 +6,35 @@
 use std::num::NonZeroU32;
 
 use bytes::Bytes;
-use failure::{bail, Error};
 use pretty_hex::PrettyHex;
+
+const FIXED_CLOCK_RATE: u32 = 8_000;
 
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
-    parameters: super::Parameters,
     pending: Option<super::AudioFrame>,
 }
 
 impl Depacketizer {
     /// Creates a new Depacketizer.
-    pub(super) fn new(clock_rate: u32) -> Result<Self, Error> {
-        if clock_rate != 8_000 {
-            bail!("Expected clock rate of 8000 for G.723, got {}", clock_rate);
+    pub(super) fn new(clock_rate: u32) -> Result<Self, String> {
+        if clock_rate != FIXED_CLOCK_RATE {
+            return Err(format!(
+                "Expected clock rate of {} for G.723, got {}",
+                FIXED_CLOCK_RATE, clock_rate
+            ));
         }
-        Ok(Self {
-            parameters: super::Parameters::Audio(super::AudioParameters {
-                rfc6381_codec: None,
-                frame_length: NonZeroU32::new(240),
-                clock_rate,
-                extra_data: Bytes::new(),
-                config: super::AudioCodecConfig::Other,
-            }),
-            pending: None,
-        })
+        Ok(Self { pending: None })
     }
 
-    pub(super) fn parameters(&self) -> Option<&super::Parameters> {
-        Some(&self.parameters)
+    pub(super) fn parameters(&self) -> Option<super::Parameters> {
+        Some(super::Parameters::Audio(super::AudioParameters {
+            rfc6381_codec: None,
+            frame_length: NonZeroU32::new(240),
+            clock_rate: FIXED_CLOCK_RATE,
+            extra_data: Bytes::new(),
+            sample_entry: None,
+        }))
     }
 
     fn validate(pkt: &crate::client::rtp::Packet) -> bool {
@@ -48,13 +48,16 @@ impl Depacketizer {
         actual_hdr_bits == expected_hdr_bits
     }
 
-    pub(super) fn push(&mut self, pkt: crate::client::rtp::Packet) -> Result<(), Error> {
+    pub(super) fn push(&mut self, pkt: crate::client::rtp::Packet) -> Result<(), String> {
         assert!(self.pending.is_none());
         if !Self::validate(&pkt) {
-            bail!("Invalid G.723 packet: {:#?}", pkt.payload.hex_dump());
+            return Err(format!(
+                "Invalid G.723 packet: {:#?}",
+                pkt.payload.hex_dump()
+            ));
         }
         self.pending = Some(super::AudioFrame {
-            ctx: pkt.rtsp_ctx,
+            ctx: pkt.ctx,
             loss: pkt.loss,
             stream_id: pkt.stream_id,
             timestamp: pkt.timestamp,
@@ -64,7 +67,7 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(&mut self) -> Result<Option<super::CodecItem>, Error> {
-        Ok(self.pending.take().map(super::CodecItem::AudioFrame))
+    pub(super) fn pull(&mut self) -> Option<super::CodecItem> {
+        self.pending.take().map(super::CodecItem::AudioFrame)
     }
 }

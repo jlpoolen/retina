@@ -15,21 +15,24 @@
 //!     *   ISO/IEC 14496-14: MP4 File Format.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use failure::{bail, format_err, Error};
 use std::{
     convert::TryFrom,
     fmt::Debug,
     num::{NonZeroU16, NonZeroU32},
 };
 
-use crate::client::rtp::Packet;
+use crate::{client::rtp::Packet, error::ErrorInt, ConnectionContext, Error};
 
 use super::CodecItem;
 
 /// An AudioSpecificConfig as in ISO/IEC 14496-3 section 1.6.2.1.
-/// Currently just a few fields of interest.
+///
+/// Currently stores the raw form and a few fields of interest.
 #[derive(Clone, Debug)]
-pub(super) struct AudioSpecificConfig {
+struct AudioSpecificConfig {
+    raw: Bytes,
+    sample_entry: Bytes,
+
     /// See ISO/IEC 14496-3 Table 1.3.
     audio_object_type: u8,
     frame_length: NonZeroU16,
@@ -64,15 +67,25 @@ const CHANNEL_CONFIGS: [Option<ChannelConfig>; 8] = [
 
 impl AudioSpecificConfig {
     /// Parses from raw bytes.
-    fn parse(config: &[u8]) -> Result<Self, Error> {
-        let mut r = bitreader::BitReader::new(config);
-        let audio_object_type = match r.read_u8(5)? {
-            31 => 32 + r.read_u8(6)?,
+    fn parse(raw: &[u8]) -> Result<Self, String> {
+        let mut r = bitreader::BitReader::new(&raw[..]);
+        let audio_object_type = match r
+            .read_u8(5)
+            .map_err(|e| format!("unable to read audio_object_type: {}", e))?
+        {
+            31 => {
+                32 + r
+                    .read_u8(6)
+                    .map_err(|e| format!("unable to read audio_object_type ext: {}", e))?
+            }
             o => o,
         };
 
         // ISO/IEC 14496-3 section 1.6.3.4.
-        let sampling_frequency = match r.read_u8(4)? {
+        let sampling_frequency = match r
+            .read_u8(4)
+            .map_err(|e| format!("unable to read sampling_frequency: {}", e))?
+        {
             0x0 => 96_000,
             0x1 => 88_200,
             0x2 => 64_000,
@@ -85,39 +98,58 @@ impl AudioSpecificConfig {
             0xa => 11_025,
             0xb => 8_000,
             0xc => 7_350,
-            v @ 0xd | v @ 0xe => bail!("reserved sampling_frequency_index value 0x{:x}", v),
-            0xf => r.read_u32(24)?,
+            v @ 0xd | v @ 0xe => {
+                return Err(format!("reserved sampling_frequency_index value 0x{:x}", v))
+            }
+            0xf => r
+                .read_u32(24)
+                .map_err(|e| format!("unable to read sampling_frequency ext: {}", e))?,
             _ => unreachable!(),
         };
         let channels = {
-            let c = r.read_u8(4)?;
+            let c = r
+                .read_u8(4)
+                .map_err(|e| format!("unable to read channels: {}", e))?;
             CHANNEL_CONFIGS
                 .get(usize::from(c))
-                .ok_or_else(|| format_err!("reserved channelConfiguration 0x{:x}", c))?
+                .ok_or_else(|| format!("reserved channelConfiguration 0x{:x}", c))?
                 .as_ref()
-                .ok_or_else(|| format_err!("program_config_element parsing unimplemented"))?
+                .ok_or_else(|| "program_config_element parsing unimplemented".to_string())?
         };
         if audio_object_type == 5 || audio_object_type == 29 {
             // extensionSamplingFrequencyIndex + extensionSamplingFrequency.
-            if r.read_u8(4)? == 0xf {
-                r.skip(24)?;
+            if r.read_u8(4)
+                .map_err(|e| format!("unable to read extensionSamplingFrequencyIndex: {}", e))?
+                == 0xf
+            {
+                r.skip(24)
+                    .map_err(|e| format!("unable to read extensionSamplingFrequency: {}", e))?;
             }
             // audioObjectType (a different one) + extensionChannelConfiguration.
-            if r.read_u8(5)? == 22 {
-                r.skip(4)?;
+            if r.read_u8(5)
+                .map_err(|e| format!("unable to read second audioObjectType: {}", e))?
+                == 22
+            {
+                r.skip(4)
+                    .map_err(|e| format!("unable to read extensionChannelConfiguration: {}", e))?;
             }
         }
 
         // The supported types here are the ones that use GASpecificConfig.
         match audio_object_type {
             1 | 2 | 3 | 4 | 6 | 7 | 17 | 19 | 20 | 21 | 22 | 23 => {}
-            o => bail!("unsupported audio_object_type {}", o),
+            o => return Err(format!("unsupported audio_object_type {}", o)),
         }
 
         // GASpecificConfig, ISO/IEC 14496-3 section 4.4.1.
-        let frame_length = match (audio_object_type, r.read_bool()?) {
+        let frame_length_flag = r
+            .read_bool()
+            .map_err(|e| format!("unable to read frame_length_flag: {}", e))?;
+        let frame_length = match (audio_object_type, frame_length_flag) {
             (3 /* AAC SR */, false) => NonZeroU16::new(256).expect("non-zero"),
-            (3 /* AAC SR */, true) => bail!("frame_length_flag must be false for AAC SSR"),
+            (3 /* AAC SR */, true) => {
+                return Err("frame_length_flag must be false for AAC SSR".into())
+            }
             (23 /* ER AAC LD */, false) => NonZeroU16::new(512).expect("non-zero"),
             (23 /* ER AAC LD */, true) => NonZeroU16::new(480).expect("non-zero"),
             (_, false) => NonZeroU16::new(1024).expect("non-zero"),
@@ -125,17 +157,32 @@ impl AudioSpecificConfig {
         };
 
         Ok(AudioSpecificConfig {
+            raw: Bytes::copy_from_slice(raw),
+            sample_entry: make_sample_entry(channels, sampling_frequency, raw)?,
             audio_object_type,
             frame_length,
             sampling_frequency,
             channels,
         })
     }
+
+    fn to_parameters(&self) -> super::AudioParameters {
+        // https://datatracker.ietf.org/doc/html/rfc6381#section-3.3
+        let rfc6381_codec = Some(format!("mp4a.40.{}", self.audio_object_type));
+        super::AudioParameters {
+            // See also TODO asking if clock_rate and sampling_frequency must match.
+            clock_rate: self.sampling_frequency,
+            rfc6381_codec,
+            frame_length: Some(NonZeroU32::from(self.frame_length)),
+            extra_data: self.raw.clone(),
+            sample_entry: Some(self.sample_entry.clone()),
+        }
+    }
 }
 
 /// Overwrites a buffer with a varint length, returning the length of the length.
 /// See ISO/IEC 14496-1 section 8.3.3.
-fn set_length(len: usize, data: &mut [u8]) -> Result<usize, Error> {
+fn set_length(len: usize, data: &mut [u8]) -> Result<usize, String> {
     if len < 1 << 7 {
         data[0] = len as u8;
         Ok(1)
@@ -156,7 +203,7 @@ fn set_length(len: usize, data: &mut [u8]) -> Result<usize, Error> {
         Ok(4)
     } else {
         // BaseDescriptor sets a maximum length of 2**28 - 1.
-        bail!("length {} too long", len);
+        return Err(format!("length {} too long", len));
     }
 }
 
@@ -173,7 +220,11 @@ macro_rules! write_box {
         };
         let pos_end = $buf.len();
         let len = pos_end.checked_sub(pos_start).unwrap();
-        $buf[pos_start..pos_start + 4].copy_from_slice(&u32::try_from(len)?.to_be_bytes()[..]);
+        $buf[pos_start..pos_start + 4].copy_from_slice(
+            &u32::try_from(len)
+                .map_err(|_| format!("box length {} exceeds u32::MAX", len))?
+                .to_be_bytes()[..],
+        );
         r
     }};
 }
@@ -207,13 +258,12 @@ macro_rules! write_descriptor {
 }
 
 /// Returns an MP4AudioSampleEntry (`mp4a`) box as in ISO/IEC 14496-14 section 5.6.1.
-/// `config` should be a raw AudioSpecificConfig (matching `parsed`).
-pub(super) fn get_mp4a_box(parameters: &super::AudioParameters) -> Result<Bytes, Error> {
-    let parsed = match parameters.config {
-        super::AudioCodecConfig::Aac(ref c) => c,
-        _ => unreachable!(),
-    };
-    let config = &parameters.extra_data[..];
+/// `config` should be a raw AudioSpecificConfig.
+fn make_sample_entry(
+    channels: &ChannelConfig,
+    sampling_frequency: u32,
+    config: &[u8],
+) -> Result<Bytes, String> {
     let mut buf = BytesMut::new();
 
     // Write an MP4AudioSampleEntry (`mp4a`), as in ISO/IEC 14496-14 section 5.6.1.
@@ -226,7 +276,7 @@ pub(super) fn get_mp4a_box(parameters: &super::AudioParameters) -> Result<Bytes,
             0, 0, 0, 0, // AudioSampleEntry.reserved
             0, 0, 0, 0, // AudioSampleEntry.reserved
         ]);
-        buf.put_u16(parsed.channels.channels);
+        buf.put_u16(channels.channels);
         buf.extend_from_slice(&[
             0x00, 0x10, // AudioSampleEntry.samplesize
             0x00, 0x00, 0x00, 0x00, // AudioSampleEntry.pre_defined, AudioSampleEntry.reserved
@@ -237,12 +287,8 @@ pub(super) fn get_mp4a_box(parameters: &super::AudioParameters) -> Result<Bytes,
         // use a SamplingRateBox. The latter also requires changing the
         // version/structure of the AudioSampleEntryBox and the version of the
         // stsd box. Just support the former for now.
-        let sampling_frequency = u16::try_from(parsed.sampling_frequency).map_err(|_| {
-            format_err!(
-                "aac sampling_frequency={} unsupported",
-                parsed.sampling_frequency
-            )
-        })?;
+        let sampling_frequency = u16::try_from(sampling_frequency)
+            .map_err(|_| format!("aac sampling_frequency={} unsupported", sampling_frequency))?;
         buf.put_u32(u32::from(sampling_frequency) << 16);
 
         // Write the embedded ESDBox (`esds`), as in ISO/IEC 14496-14 section 5.6.1.
@@ -269,16 +315,15 @@ pub(super) fn get_mp4a_box(parameters: &super::AudioParameters) -> Result<Bytes,
                     // elementary stream in byte". ISO/IEC 13818-7 section
                     // 8.2.2.1 defines the total decoder input buffer size as
                     // 6144 bits per NCC.
-                    let buffer_size_bytes = (6144 / 8) * u32::from(parsed.channels.ncc);
+                    let buffer_size_bytes = (6144 / 8) * u32::from(channels.ncc);
                     debug_assert!(buffer_size_bytes <= 0xFF_FFFF);
 
                     // buffer_size_bytes as a 24-bit number
                     buf.put_u8((buffer_size_bytes >> 16) as u8);
                     buf.put_u16(buffer_size_bytes as u16);
 
-                    let max_bitrate = (6144 / 1024)
-                        * u32::from(parsed.channels.ncc)
-                        * u32::from(sampling_frequency);
+                    let max_bitrate =
+                        (6144 / 1024) * u32::from(channels.ncc) * u32::from(sampling_frequency);
                     buf.put_u32(max_bitrate);
 
                     // avg_bitrate. ISO/IEC 14496-1 section 7.2.6.6 says "for streams with
@@ -307,7 +352,7 @@ pub(super) fn get_mp4a_box(parameters: &super::AudioParameters) -> Result<Bytes,
 fn parse_format_specific_params(
     clock_rate: u32,
     format_specific_params: &str,
-) -> Result<super::AudioParameters, Error> {
+) -> Result<AudioSpecificConfig, String> {
     let mut mode = None;
     let mut config = None;
     let mut size_length = None;
@@ -321,29 +366,28 @@ fn parse_format_specific_params(
         }
         let (key, value) = p
             .split_once('=')
-            .ok_or_else(|| format_err!("bad format-specific-param {}", p))?;
+            .ok_or_else(|| format!("bad format-specific-param {}", p))?;
         match &key.to_ascii_lowercase()[..] {
             "config" => {
                 config = Some(
                     hex::decode(value)
-                        .map_err(|_| format_err!("config has invalid hex encoding"))?,
+                        .map_err(|_| "config has invalid hex encoding".to_string())?,
                 );
             }
             "mode" => mode = Some(value),
             "sizelength" => {
-                size_length = Some(
-                    u16::from_str_radix(value, 10).map_err(|_| format_err!("bad sizeLength"))?,
-                );
+                size_length =
+                    Some(u16::from_str_radix(value, 10).map_err(|_| "bad sizeLength".to_string())?);
             }
             "indexlength" => {
                 index_length = Some(
-                    u16::from_str_radix(value, 10).map_err(|_| format_err!("bad indexLength"))?,
+                    u16::from_str_radix(value, 10).map_err(|_| "bad indexLength".to_string())?,
                 );
             }
             "indexdeltalength" => {
                 index_delta_length = Some(
                     u16::from_str_radix(value, 10)
-                        .map_err(|_| format_err!("bad indexDeltaLength"))?,
+                        .map_err(|_| "bad indexDeltaLength".to_string())?,
                 );
             }
             _ => {}
@@ -351,53 +395,38 @@ fn parse_format_specific_params(
     }
     // https://datatracker.ietf.org/doc/html/rfc3640#section-3.3.6 AAC-hbr
     if mode != Some("AAC-hbr") {
-        bail!("Expected mode AAC-hbr, got {:#?}", mode);
+        return Err(format!("Expected mode AAC-hbr, got {:#?}", mode));
     }
-    let config = config.ok_or_else(|| format_err!("config must be specified"))?;
+    let config = config.ok_or_else(|| "config must be specified".to_string())?;
     if size_length != Some(13) || index_length != Some(3) || index_delta_length != Some(3) {
-        bail!(
+        return Err(format!(
             "Unexpected sizeLength={:?} indexLength={:?} indexDeltaLength={:?}",
-            size_length,
-            index_length,
-            index_delta_length
-        );
+            size_length, index_length, index_delta_length
+        ));
     }
 
-    let parsed = AudioSpecificConfig::parse(&config[..])?;
+    let config = AudioSpecificConfig::parse(&config[..])?;
 
     // TODO: is this a requirement? I might have read somewhere one can be a multiple of the other.
-    if clock_rate != parsed.sampling_frequency {
-        bail!(
+    if clock_rate != config.sampling_frequency {
+        return Err(format!(
             "Expected RTP clock rate {} and AAC sampling frequency {} to match",
-            clock_rate,
-            parsed.sampling_frequency
-        );
+            clock_rate, config.sampling_frequency
+        ));
     }
 
-    // https://datatracker.ietf.org/doc/html/rfc6381#section-3.3
-    let rfc6381_codec = Some(format!("mp4a.40.{}", parsed.audio_object_type));
-    let frame_length = Some(parsed.frame_length);
-    Ok(super::AudioParameters {
-        config: super::AudioCodecConfig::Aac(parsed),
-        clock_rate,
-        rfc6381_codec,
-        frame_length: frame_length.map(NonZeroU32::from),
-        extra_data: Bytes::from(config),
-    })
+    Ok(config)
 }
 
 #[derive(Debug)]
 pub(crate) struct Depacketizer {
-    parameters: super::Parameters,
-
-    /// This is in parameters but duplicated here to avoid destructuring.
-    frame_length: NonZeroU16,
+    config: AudioSpecificConfig,
     state: DepacketizerState,
 }
 
 #[derive(Debug)]
 struct Aggregate {
-    ctx: crate::Context,
+    ctx: crate::RtspMessageContext,
 
     /// RTP packets lost before the next frame in this aggregate. Includes old
     /// loss that caused a previous fragment to be too short.
@@ -410,7 +439,10 @@ struct Aggregate {
     /// to be too short.
     loss_since_mark: bool,
 
+    channel_id: u8,
     stream_id: usize,
+    ssrc: u32,
+    sequence_number: u16,
 
     /// The RTP-level timestamp; frame `i` is at timestamp `timestamp + frame_length*i`.
     timestamp: crate::Timestamp,
@@ -463,34 +495,27 @@ impl Depacketizer {
         clock_rate: u32,
         channels: Option<NonZeroU16>,
         format_specific_params: Option<&str>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, String> {
         let format_specific_params = format_specific_params
-            .ok_or_else(|| format_err!("AAC requires format specific params"))?;
-        let parameters = parse_format_specific_params(clock_rate, format_specific_params)?;
-        let parsed = match parameters.config {
-            super::AudioCodecConfig::Aac(ref c) => c,
-            _ => unreachable!(),
-        };
-        if matches!(channels, Some(c) if c.get() != parsed.channels.channels) {
-            bail!(
+            .ok_or_else(|| "AAC requires format specific params".to_string())?;
+        let config = parse_format_specific_params(clock_rate, format_specific_params)?;
+        if matches!(channels, Some(c) if c.get() != config.channels.channels) {
+            return Err(format!(
                 "Expected RTP channels {:?} and AAC channels {:?} to match",
-                channels,
-                parsed.channels
-            );
+                channels, config.channels
+            ));
         }
-        let frame_length = parsed.frame_length;
         Ok(Self {
-            parameters: super::Parameters::Audio(parameters),
-            frame_length,
+            config,
             state: DepacketizerState::Idle { prev_loss: 0 },
         })
     }
 
-    pub(super) fn parameters(&self) -> Option<&super::Parameters> {
-        Some(&self.parameters)
+    pub(super) fn parameters(&self) -> Option<super::Parameters> {
+        Some(super::Parameters::Audio(self.config.to_parameters()))
     }
 
-    pub(super) fn push(&mut self, mut pkt: Packet) -> Result<(), Error> {
+    pub(super) fn push(&mut self, mut pkt: Packet) -> Result<(), String> {
         if pkt.loss > 0 && matches!(self.state, DepacketizerState::Fragmented(_)) {
             log::debug!(
                 "Discarding fragmented AAC frame due to loss of {} RTP packets.",
@@ -501,38 +526,37 @@ impl Depacketizer {
 
         // Read the AU headers.
         if pkt.payload.len() < 2 {
-            bail!("packet too short for au-header-length");
+            return Err("packet too short for au-header-length".to_string());
         }
         let au_headers_length_bits = pkt.payload.get_u16();
 
         // AAC-hbr requires 16-bit AU headers: 13-bit size, 3-bit index.
         if (au_headers_length_bits & 0x7) != 0 {
-            bail!("bad au-headers-length {}", au_headers_length_bits);
+            return Err(format!("bad au-headers-length {}", au_headers_length_bits));
         }
         let au_headers_count = au_headers_length_bits >> 4;
         let data_off = usize::from(au_headers_count) << 1;
         if pkt.payload.len() < (usize::from(au_headers_count) << 1) {
-            bail!("packet too short for au-headers");
+            return Err("packet too short for au-headers".to_string());
         }
         match &mut self.state {
             DepacketizerState::Fragmented(ref mut frag) => {
                 if au_headers_count != 1 {
-                    bail!(
+                    return Err(format!(
                         "Got {}-AU packet while fragment in progress",
                         au_headers_count
-                    );
+                    ));
                 }
                 if (pkt.timestamp.timestamp as u16) != frag.rtp_timestamp {
-                    bail!(
+                    return Err(format!(
                         "Timestamp changed from 0x{:04x} to 0x{:04x} mid-fragment",
-                        frag.rtp_timestamp,
-                        pkt.timestamp.timestamp as u16
-                    );
+                        frag.rtp_timestamp, pkt.timestamp.timestamp as u16
+                    ));
                 }
                 let au_header = u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]);
                 let size = usize::from(au_header >> 3);
                 if size != usize::from(frag.size) {
-                    bail!("size changed {}->{} mid-fragment", frag.size, size);
+                    return Err(format!("size changed {}->{} mid-fragment", frag.size, size));
                 }
                 let data = &pkt.payload[data_off..];
                 match (frag.buf.len() + data.len()).cmp(&size) {
@@ -544,42 +568,47 @@ impl Depacketizer {
                                 };
                                 return Ok(());
                             }
-                            bail!(
+                            return Err(format!(
                                 "frag marked complete when {}+{}<{}",
                                 frag.buf.len(),
                                 data.len(),
                                 size
-                            );
+                            ));
                         }
                     }
                     std::cmp::Ordering::Equal => {
                         if !pkt.mark {
-                            bail!("frag not marked complete when full data present");
+                            return Err(
+                                "frag not marked complete when full data present".to_string()
+                            );
                         }
                         frag.buf.extend_from_slice(data);
                         println!("au {}: len-{}, fragmented", &pkt.timestamp, size);
                         self.state = DepacketizerState::Ready(super::AudioFrame {
-                            ctx: pkt.rtsp_ctx,
+                            ctx: pkt.ctx,
                             loss: frag.loss,
-                            frame_length: NonZeroU32::from(self.frame_length),
+                            frame_length: NonZeroU32::from(self.config.frame_length),
                             stream_id: pkt.stream_id,
                             timestamp: pkt.timestamp,
                             data: std::mem::take(&mut frag.buf).freeze(),
                         });
                     }
-                    std::cmp::Ordering::Greater => bail!("too much data in fragment"),
+                    std::cmp::Ordering::Greater => return Err("too much data in fragment".into()),
                 }
             }
             DepacketizerState::Aggregated(_) => panic!("push when already in state aggregated"),
             DepacketizerState::Idle { prev_loss } => {
                 if au_headers_count == 0 {
-                    bail!("aggregate with no headers");
+                    return Err("aggregate with no headers".to_string());
                 }
                 self.state = DepacketizerState::Aggregated(Aggregate {
-                    ctx: pkt.rtsp_ctx,
+                    ctx: pkt.ctx,
                     loss: *prev_loss + pkt.loss,
                     loss_since_mark: pkt.loss > 0,
+                    channel_id: pkt.channel_id,
                     stream_id: pkt.stream_id,
+                    ssrc: pkt.ssrc,
+                    sequence_number: pkt.sequence_number,
                     timestamp: pkt.timestamp,
                     buf: pkt.payload,
                     frame_i: 0,
@@ -593,7 +622,10 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(&mut self) -> Result<Option<super::CodecItem>, Error> {
+    pub(super) fn pull(
+        &mut self,
+        conn_ctx: &ConnectionContext,
+    ) -> Result<Option<super::CodecItem>, Error> {
         match std::mem::replace(&mut self.state, DepacketizerState::Idle { prev_loss: 0 }) {
             s @ DepacketizerState::Idle { .. } | s @ DepacketizerState::Fragmented(..) => {
                 self.state = s;
@@ -613,15 +645,27 @@ impl Depacketizer {
                     // indicate interleaving, which we don't support.
                     // TODO: https://datatracker.ietf.org/doc/html/rfc3640#section-3.3.6
                     // says "receivers MUST support de-interleaving".
-                    bail!("interleaving not yet supported");
+                    return Err(error(
+                        *conn_ctx,
+                        agg,
+                        "interleaving not yet supported".to_owned(),
+                    ));
                 }
                 if size > agg.buf.len() - agg.data_off {
                     // start of fragment
                     if agg.frame_count != 1 {
-                        bail!("fragmented AUs must not share packets");
+                        return Err(error(
+                            *conn_ctx,
+                            agg,
+                            "fragmented AUs must not share packets".to_owned(),
+                        ));
                     }
                     if agg.mark {
-                        bail!("mark can't be set on beginning of fragment");
+                        return Err(error(
+                            *conn_ctx,
+                            agg,
+                            "mark can't be set on beginning of fragment".to_owned(),
+                        ));
                     }
                     let mut buf = BytesMut::with_capacity(size);
                     buf.extend_from_slice(&agg.buf[agg.data_off..]);
@@ -635,18 +679,35 @@ impl Depacketizer {
                     return Ok(None);
                 }
                 if !agg.mark {
-                    bail!("mark must be set on non-fragmented au");
+                    return Err(error(
+                        *conn_ctx,
+                        agg,
+                        "mark must be set on non-fragmented au".to_owned(),
+                    ));
                 }
+
+                let delta = u32::from(agg.frame_i) * u32::from(self.config.frame_length.get());
+                let agg_timestamp = agg.timestamp;
                 let frame = super::AudioFrame {
                     ctx: agg.ctx,
                     loss: agg.loss,
                     stream_id: agg.stream_id,
-                    frame_length: NonZeroU32::from(self.frame_length),
+                    frame_length: NonZeroU32::from(self.config.frame_length),
 
                     // u16 * u16 can't overflow u32, but i64 + u32 can overflow i64.
-                    timestamp: agg
-                        .timestamp
-                        .try_add(u32::from(agg.frame_i) * u32::from(self.frame_length.get()))?,
+                    timestamp: match agg_timestamp.try_add(delta) {
+                        Some(t) => t,
+                        None => {
+                            return Err(error(
+                                *conn_ctx,
+                                agg,
+                                format!(
+                                    "aggregate timestamp {} + {} overflows",
+                                    agg_timestamp, delta
+                                ),
+                            ))
+                        }
+                    },
                     data: agg.buf.slice(agg.data_off..agg.data_off + size),
                 };
                 agg.loss = 0;
@@ -659,6 +720,18 @@ impl Depacketizer {
             }
         }
     }
+}
+
+fn error(conn_ctx: ConnectionContext, agg: Aggregate, description: String) -> Error {
+    Error(Box::new(ErrorInt::RtpPacketError {
+        conn_ctx,
+        msg_ctx: agg.ctx,
+        channel_id: agg.channel_id,
+        stream_id: agg.stream_id,
+        ssrc: agg.ssrc,
+        sequence_number: agg.sequence_number,
+        description,
+    }))
 }
 
 #[cfg(test)]

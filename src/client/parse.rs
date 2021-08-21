@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use bytes::{Buf, Bytes};
-use failure::{bail, format_err, Error, ResultExt};
 use log::debug;
+use pretty_hex::PrettyHex;
 use sdp::media_description::MediaDescription;
 use std::{convert::TryFrom, num::NonZeroU16};
 use url::Url;
@@ -184,17 +184,34 @@ static STATIC_PAYLOAD_TYPES: [Option<StaticPayloadType>; 35] = [
     }),
 ];
 
-fn join_control(base_url: &Url, control: &str) -> Result<Url, Error> {
+/// Joins a control URL to a base URL in a non-RFC-compliant but common way.
+/// This matches what live555 and ffmpeg do.
+///
+/// See discussion at [#9](https://github.com/scottlamb/retina/issues/9).
+fn join_control(base_url: &Url, control: &str) -> Result<Url, String> {
     if control == "*" {
         return Ok(base_url.clone());
     }
-    Ok(base_url.join(control).with_context(|_| {
-        format_err!(
-            "unable to join base url {} with control url {:?}",
-            base_url,
-            control
+    if let Ok(absolute_url) = Url::parse(control) {
+        return Ok(absolute_url);
+    }
+
+    Url::parse(&format!(
+        "{}{}{}",
+        base_url.as_str(),
+        if base_url.as_str().ends_with('/') {
+            ""
+        } else {
+            "/"
+        },
+        control
+    ))
+    .map_err(|e| {
+        format!(
+            "unable to join base url {} with control url {:?}: {}",
+            base_url, control, e
         )
-    })?)
+    })
 }
 
 /// Returns the `CSeq` from an RTSP response as a `u32`, or `None` if missing/unparseable.
@@ -206,12 +223,8 @@ pub(crate) fn get_cseq(response: &rtsp_types::Response<Bytes>) -> Option<u32> {
 
 /// Parses a [MediaDescription] to a [Stream].
 /// On failure, returns an error which is expected to be supplemented with
-/// the [MediaDescription] debug string.
-fn parse_media(
-    base_url: &Url,
-    alt_base_url: &Url,
-    media_description: &MediaDescription,
-) -> Result<Stream, Error> {
+/// the [MediaDescription] debug string and packed into a `RtspResponseError`.
+fn parse_media(base_url: &Url, media_description: &MediaDescription) -> Result<Stream, String> {
     let media = media_description.media_name.media.clone();
 
     // https://tools.ietf.org/html/rfc8866#section-5.14 says "If the <proto>
@@ -226,7 +239,7 @@ fn parse_media(
         .iter()
         .any(|p| p == "RTP")
     {
-        bail!("Expected RTP-based proto");
+        return Err("Expected RTP-based proto".into());
     }
 
     // RFC 8866 continues: "When a list of payload type numbers is given,
@@ -238,11 +251,11 @@ fn parse_media(
         .media_name
         .formats
         .first()
-        .ok_or_else(|| format_err!("missing RTP payload type"))?;
+        .ok_or_else(|| "missing RTP payload type".to_string())?;
     let rtp_payload_type = u8::from_str_radix(rtp_payload_type_str, 10)
-        .map_err(|_| format_err!("invalid RTP payload type"))?;
+        .map_err(|_| format!("invalid RTP payload type {:?}", rtp_payload_type_str))?;
     if (rtp_payload_type & 0x80) != 0 {
-        bail!("invalid RTP payload type");
+        return Err(format!("invalid RTP payload type {}", rtp_payload_type));
     }
 
     // Capture interesting attributes.
@@ -254,13 +267,12 @@ fn parse_media(
     let mut rtpmap = None;
     let mut fmtp = None;
     let mut control = None;
-    let mut alt_control = None;
     for a in &media_description.attributes {
         if a.key == "rtpmap" {
             let v = a
                 .value
                 .as_ref()
-                .ok_or_else(|| format_err!("rtpmap attribute with no value"))?;
+                .ok_or_else(|| "rtpmap attribute with no value".to_string())?;
             // https://tools.ietf.org/html/rfc8866#section-6.6
             // rtpmap-value = payload-type SP encoding-name
             //   "/" clock-rate [ "/" encoding-params ]
@@ -271,7 +283,7 @@ fn parse_media(
             // channels = integer
             let (rtpmap_payload_type, v) = v
                 .split_once(' ')
-                .ok_or_else(|| format_err!("invalid rtmap attribute"))?;
+                .ok_or_else(|| "invalid rtmap attribute".to_string())?;
             if rtpmap_payload_type == rtp_payload_type_str {
                 rtpmap = Some(v);
             }
@@ -280,10 +292,10 @@ fn parse_media(
             let v = a
                 .value
                 .as_ref()
-                .ok_or_else(|| format_err!("rtpmap attribute with no value"))?;
+                .ok_or_else(|| "fmtp attribute with no value".to_string())?;
             let (fmtp_payload_type, v) = v
                 .split_once(' ')
-                .ok_or_else(|| format_err!("invalid rtmap attribute"))?;
+                .ok_or_else(|| "invalid fmtp attribute".to_string())?;
             if fmtp_payload_type == rtp_payload_type_str {
                 fmtp = Some(v);
             }
@@ -292,11 +304,6 @@ fn parse_media(
                 .value
                 .as_deref()
                 .map(|c| join_control(base_url, c))
-                .transpose()?;
-            alt_control = a
-                .value
-                .as_deref()
-                .map(|c| join_control(alt_base_url, c))
                 .transpose()?;
         }
     }
@@ -308,20 +315,20 @@ fn parse_media(
         Some(rtpmap) => {
             let (e, rtpmap) = rtpmap
                 .split_once('/')
-                .ok_or_else(|| format_err!("invalid rtpmap attribute"))?;
+                .ok_or_else(|| "invalid rtpmap attribute".to_string())?;
             encoding_name = e;
             let (clock_rate_str, channels_str) = match rtpmap.find('/') {
                 None => (rtpmap, None),
                 Some(i) => (&rtpmap[..i], Some(&rtpmap[i + 1..])),
             };
             clock_rate = u32::from_str_radix(clock_rate_str, 10)
-                .map_err(|_| format_err!("bad clockrate in rtpmap"))?;
+                .map_err(|_| "bad clockrate in rtpmap".to_string())?;
             channels = channels_str
                 .map(|c| {
                     u16::from_str_radix(c, 10)
                         .ok()
                         .and_then(NonZeroU16::new)
-                        .ok_or_else(|| format_err!("Invalid channels specification {:?}", c))
+                        .ok_or_else(|| format!("Invalid channels specification {:?}", c))
                 })
                 .transpose()?;
         }
@@ -330,7 +337,7 @@ fn parse_media(
                 .get(usize::from(rtp_payload_type))
                 .and_then(Option::as_ref)
                 .ok_or_else(|| {
-                    format_err!(
+                    format!(
                         "Expected rtpmap parameter or assigned static payload type (got {})",
                         rtp_payload_type
                     )
@@ -339,11 +346,10 @@ fn parse_media(
             clock_rate = type_.clock_rate;
             channels = type_.channels;
             if type_.media != media {
-                bail!(
+                return Err(format!(
                     "SDP media type {} must match RTP payload type {:#?}",
-                    &media,
-                    type_
-                );
+                    &media, type_
+                ));
             }
         }
     }
@@ -359,45 +365,55 @@ fn parse_media(
         rtp_payload_type,
         depacketizer,
         control,
-        alt_control,
         channels,
         state: super::StreamState::Uninit,
     })
 }
 
 /// Parses a successful RTSP `DESCRIBE` response into a [Presentation].
+/// On error, returns a string which is expected to be packed into an `RtspProtocolError`.
 pub(crate) fn parse_describe(
     request_url: Url,
-    response: rtsp_types::Response<Bytes>,
-) -> Result<Presentation, Error> {
+    response: &rtsp_types::Response<Bytes>,
+) -> Result<Presentation, String> {
     if !matches!(response.header(&rtsp_types::headers::CONTENT_TYPE), Some(v) if v.as_str() == "application/sdp")
     {
-        bail!(
+        return Err(format!(
             "Describe response not of expected application/sdp content type: {:#?}",
             &response
-        );
+        ));
     }
 
     let sdp;
     {
         let mut cursor = std::io::Cursor::new(&response.body()[..]);
-        sdp = sdp::session_description::SessionDescription::unmarshal(&mut cursor)?;
+        sdp =
+            sdp::session_description::SessionDescription::unmarshal(&mut cursor).map_err(|e| {
+                format!(
+                    "Unable to parse SDP: {}\n\n{:#?}",
+                    e,
+                    response.body().hex_dump()
+                )
+            })?;
         if cursor.has_remaining() {
-            bail!(
+            return Err(format!(
                 "garbage after sdp: {:?}",
                 &response.body()[usize::try_from(cursor.position()).unwrap()..]
-            );
+            ));
         }
     }
 
     // https://tools.ietf.org/html/rfc2326#appendix-C.1.1
     let base_url = response
         .header(&rtsp_types::headers::CONTENT_BASE)
-        .or_else(|| response.header(&rtsp_types::headers::CONTENT_LOCATION))
-        .map(|v| Url::parse(v.as_str()))
-        .unwrap_or(Ok(request_url))?;
-    let mut alt_base_url = base_url.clone();
-    alt_base_url.set_path(&format!("{}/", base_url.path()));
+        .map(|v| (rtsp_types::headers::CONTENT_BASE, v))
+        .or_else(|| {
+            response
+                .header(&rtsp_types::headers::CONTENT_LOCATION)
+                .map(|v| (rtsp_types::headers::CONTENT_LOCATION, v))
+        })
+        .map(|(h, v)| Url::parse(v.as_str()).map_err(|e| format!("bad {} {:?}: {}", h, v, e)))
+        .unwrap_or(Ok(request_url.clone()))?;
 
     let mut control = None;
     for a in &sdp.attributes {
@@ -410,18 +426,17 @@ pub(crate) fn parse_describe(
             break;
         }
     }
-    let control = control.ok_or_else(|| format_err!("no control url"))?;
+    let control = control.unwrap_or(request_url);
 
     let streams = sdp
         .media_descriptions
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            parse_media(&base_url, &alt_base_url, &m)
-                .with_context(|_| format!("Unable to parse stream {}: {:#?}", i, &m))
-                .map_err(Error::from)
+            parse_media(&base_url, &m)
+                .map_err(|e| format!("Unable to parse stream {}: {}\n\n{:#?}", i, &e, &m))
         })
-        .collect::<Result<Vec<Stream>, Error>>()?;
+        .collect::<Result<Vec<Stream>, String>>()?;
 
     let accept_dynamic_rate =
         matches!(response.header(&crate::X_ACCEPT_DYNAMIC_RATE), Some(h) if h.as_str() == "1");
@@ -445,43 +460,40 @@ pub(crate) struct SetupResponse<'a> {
 /// `session_id` is checked for assignment or reassignment.
 /// Returns an assigned interleaved channel id (implying the next channel id
 /// is also assigned) or errors.
-pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<SetupResponse, Error> {
+pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<SetupResponse, String> {
     let session = response
         .header(&rtsp_types::headers::SESSION)
-        .ok_or_else(|| format_err!("SETUP response has no Session header"))?;
+        .ok_or_else(|| "Missing Session header".to_string())?;
     let session_id = match session.as_str().find(';') {
         None => session.as_str(),
         Some(i) => &session.as_str()[..i],
     };
     let transport = response
         .header(&rtsp_types::headers::TRANSPORT)
-        .ok_or_else(|| format_err!("SETUP response has no Transport header"))?;
+        .ok_or_else(|| "Missing Transport header".to_string())?;
     let mut channel_id = None;
     let mut ssrc = None;
     for part in transport.as_str().split(';') {
         if let Some(v) = part.strip_prefix("ssrc=") {
-            let v =
-                u32::from_str_radix(v, 16).map_err(|_| format_err!("Unparseable ssrc {}", v))?;
+            let v = u32::from_str_radix(v, 16).map_err(|_| format!("Unparseable ssrc {}", v))?;
             ssrc = Some(v);
             break;
         } else if let Some(interleaved) = part.strip_prefix("interleaved=") {
             let mut channels = interleaved.splitn(2, '-');
             let n = channels.next().expect("splitn returns at least one part");
-            let n =
-                u8::from_str_radix(n, 10).map_err(|_| format_err!("bad channel number {}", n))?;
+            let n = u8::from_str_radix(n, 10).map_err(|_| format!("bad channel number {}", n))?;
             if let Some(m) = channels.next() {
                 let m = u8::from_str_radix(m, 10)
-                    .map_err(|_| format_err!("bad second channel number {}", m))?;
+                    .map_err(|_| format!("bad second channel number {}", m))?;
                 if n.checked_add(1) != Some(m) {
-                    bail!("Expected adjacent channels; got {}-{}", n, m);
+                    format!("Expected adjacent channels; got {}-{}", n, m);
                 }
             }
             channel_id = Some(n);
         }
     }
-    let channel_id = channel_id.ok_or_else(|| {
-        format_err!("SETUP response Transport header has no interleaved parameter")
-    })?;
+    let channel_id =
+        channel_id.ok_or_else(|| "Transport header has no interleaved parameter".to_string())?;
     Ok(SetupResponse {
         session_id,
         ssrc,
@@ -489,14 +501,16 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
     })
 }
 
+/// Parses a `PLAY` response. The error should always be packed into a `RtspProtocolError`.
 pub(crate) fn parse_play(
-    response: rtsp_types::Response<Bytes>,
+    response: &rtsp_types::Response<Bytes>,
     presentation: &mut Presentation,
-) -> Result<(), Error> {
+) -> Result<(), String> {
     // https://tools.ietf.org/html/rfc2326#section-12.33
-    let rtp_info = response
-        .header(&rtsp_types::headers::RTP_INFO)
-        .ok_or_else(|| format_err!("PLAY response has no RTP-Info header"))?;
+    let rtp_info = match response.header(&rtsp_types::headers::RTP_INFO) {
+        Some(rtsp_info) => rtsp_info,
+        None => return Ok(()),
+    };
     for s in rtp_info.as_str().split(',') {
         let s = s.trim();
         let mut parts = s.split(';');
@@ -504,9 +518,9 @@ pub(crate) fn parse_play(
             .next()
             .expect("split always returns at least one part")
             .strip_prefix("url=")
-            .ok_or_else(|| format_err!("RTP-Info missing stream URL"))?;
+            .ok_or_else(|| "RTP-Info missing stream URL".to_string())?;
         let url = join_control(&presentation.base_url, url)?;
-        let mut stream;
+        let stream;
         if presentation.streams.len() == 1 {
             // The server is allowed to not specify a stream control URL for
             // single-stream presentations. Additionally, some buggy
@@ -522,18 +536,14 @@ pub(crate) fn parse_play(
                 .streams
                 .iter_mut()
                 .find(|s| matches!(&s.control, Some(u) if u == &url));
-
-            // If we didn't find a stream, try again with alt_control. Don't do
-            // this on the first pass because we should check all of the
-            // proper control URLs first.
-            if stream.is_none() {
-                stream = presentation
-                    .streams
-                    .iter_mut()
-                    .find(|s| matches!(&s.alt_control, Some(u) if u == &url));
-            }
         }
-        let stream = stream.ok_or_else(|| format_err!("can't find RTP-Info stream {}", url))?;
+        let stream = match stream {
+            Some(s) => s,
+            None => {
+                log::warn!("RTP-Info contains unknown stream {}", url);
+                continue;
+            }
+        };
         let state = match &mut stream.state {
             super::StreamState::Uninit => {
                 // This appears to happen for Reolink devices when we did not send a SETUP request
@@ -551,21 +561,21 @@ pub(crate) fn parse_play(
         for part in parts {
             let (key, value) = part
                 .split_once('=')
-                .ok_or_else(|| format_err!("RTP-Info param has no ="))?;
+                .ok_or_else(|| "RTP-Info param has no =".to_string())?;
             match key {
                 "seq" => {
                     let seq = u16::from_str_radix(value, 10)
-                        .map_err(|_| format_err!("bad seq {:?}", value))?;
+                        .map_err(|_| format!("bad seq {:?}", value))?;
                     state.initial_seq = Some(seq);
                 }
                 "rtptime" => {
                     let rtptime = u32::from_str_radix(value, 10)
-                        .map_err(|_| format_err!("bad rtptime {:?}", value))?;
+                        .map_err(|_| format!("bad rtptime {:?}", value))?;
                     state.initial_rtptime = Some(rtptime);
                 }
                 "ssrc" => {
                     let ssrc = u32::from_str_radix(value, 16)
-                        .map_err(|_| format_err!("Unparseable ssrc {}", value))?;
+                        .map_err(|_| format!("Unparseable ssrc {}", value))?;
                     state.ssrc = Some(ssrc);
                 }
                 _ => {}
@@ -579,44 +589,32 @@ pub(crate) fn parse_play(
 mod tests {
     use std::num::NonZeroU16;
 
-    use bytes::Bytes;
-    use failure::Error;
     use url::Url;
 
     use crate::{client::StreamStateInit, codec::Parameters};
 
     use super::super::StreamState;
-
-    fn response(raw: &'static [u8]) -> rtsp_types::Response<Bytes> {
-        let (msg, len) = rtsp_types::Message::parse(raw).unwrap();
-        assert_eq!(len, raw.len());
-        match msg {
-            rtsp_types::Message::Response(r) => r.map_body(|b| Bytes::from_static(b)),
-            _ => panic!("unexpected message type"),
-        }
-    }
+    use crate::testutil::response;
 
     fn parse_describe(
         raw_url: &str,
         raw_response: &'static [u8],
-    ) -> Result<super::Presentation, Error> {
+    ) -> Result<super::Presentation, String> {
         let url = Url::parse(raw_url).unwrap();
-        super::parse_describe(url, response(raw_response))
+        super::parse_describe(url, &response(raw_response))
     }
 
     #[test]
     fn dahua_h264_aac_onvif() {
         // DESCRIBE.
-        let prefix = "rtsp://192.168.5.111:554/cam/";
+        let prefix =
+            "rtsp://192.168.5.111:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif";
         let mut p = parse_describe(
-            &(prefix.to_string() + "realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif"),
+            prefix,
             include_bytes!("testdata/dahua_describe_h264_aac_onvif.txt"),
         )
         .unwrap();
-        assert_eq!(
-            p.control.as_str(),
-            &(prefix.to_string() + "realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif/")
-        );
+        assert_eq!(p.control.as_str(), &(prefix.to_string() + "/"));
         assert!(p.accept_dynamic_rate);
 
         assert_eq!(p.streams.len(), 3);
@@ -624,7 +622,7 @@ mod tests {
         // H.264 video stream.
         assert_eq!(
             p.streams[0].control.as_ref().unwrap().as_str(),
-            &(prefix.to_string() + "trackID=0")
+            &(prefix.to_string() + "/trackID=0")
         );
         assert_eq!(p.streams[0].media, "video");
         assert_eq!(p.streams[0].encoding_name, "h264");
@@ -643,7 +641,7 @@ mod tests {
         // .mp4 audio stream.
         assert_eq!(
             p.streams[1].control.as_ref().unwrap().as_str(),
-            &(prefix.to_string() + "trackID=1")
+            &(prefix.to_string() + "/trackID=1")
         );
         assert_eq!(p.streams[1].media, "audio");
         assert_eq!(p.streams[1].encoding_name, "mpeg4-generic");
@@ -657,7 +655,7 @@ mod tests {
         // ONVIF parameters stream.
         assert_eq!(
             p.streams[2].control.as_ref().unwrap().as_str(),
-            &(prefix.to_string() + "trackID=4")
+            &(prefix.to_string() + "/trackID=4")
         );
         assert_eq!(p.streams[2].media, "application");
         assert_eq!(p.streams[2].encoding_name, "vnd.onvif.metadata");
@@ -681,7 +679,7 @@ mod tests {
         });
 
         // PLAY.
-        super::parse_play(response(include_bytes!("testdata/dahua_play.txt")), &mut p).unwrap();
+        super::parse_play(&response(include_bytes!("testdata/dahua_play.txt")), &mut p).unwrap();
         match &p.streams[0].state {
             StreamState::Init(s) => {
                 assert_eq!(s.initial_seq, Some(47121));
@@ -779,7 +777,7 @@ mod tests {
 
         // PLAY.
         super::parse_play(
-            response(include_bytes!("testdata/hikvision_play.txt")),
+            &response(include_bytes!("testdata/hikvision_play.txt")),
             &mut p,
         )
         .unwrap();
@@ -851,7 +849,7 @@ mod tests {
 
         // PLAY.
         super::parse_play(
-            response(include_bytes!("testdata/reolink_play.txt")),
+            &response(include_bytes!("testdata/reolink_play.txt")),
             &mut p,
         )
         .unwrap();
@@ -928,7 +926,7 @@ mod tests {
         p.streams[1].state = StreamState::Init(StreamStateInit::default());
 
         // PLAY.
-        super::parse_play(response(include_bytes!("testdata/bunny_play.txt")), &mut p).unwrap();
+        super::parse_play(&response(include_bytes!("testdata/bunny_play.txt")), &mut p).unwrap();
         match p.streams[1].state {
             StreamState::Init(state) => {
                 assert_eq!(state.initial_rtptime, Some(0));
@@ -984,6 +982,55 @@ mod tests {
         };
     }
 
+    #[test]
+    fn vstarcam() {
+        // DESCRIBE.
+        let prefix = "rtsp://192.168.1.198:10554/tcp/av0_0";
+        let p = parse_describe(prefix, include_bytes!("testdata/vstarcam_describe.txt")).unwrap();
+        assert_eq!(p.control.as_str(), &(prefix.to_string()));
+
+        assert!(!p.accept_dynamic_rate);
+
+        assert_eq!(p.streams.len(), 2);
+
+        // H.264 video stream.
+        assert_eq!(
+            p.streams[0].control.as_ref().unwrap().as_str(),
+            &(prefix.to_string() + "/track0")
+        );
+
+        assert_eq!(p.streams[0].media, "video");
+
+        assert_eq!(p.streams[0].encoding_name, "h264");
+        assert_eq!(p.streams[0].rtp_payload_type, 96);
+        assert_eq!(p.streams[0].clock_rate, 90_000);
+
+        match p.streams[0].parameters().unwrap() {
+            Parameters::Video(v) => {
+                assert_eq!(v.rfc6381_codec(), "avc1.4D002A");
+                assert_eq!(v.pixel_dimensions(), (1920, 1080));
+                assert_eq!(v.pixel_aspect_ratio(), None);
+                assert_eq!(v.frame_rate(), Some((2, 15)));
+            }
+            _ => panic!(),
+        }
+
+        // audio stream
+        assert_eq!(
+            p.streams[1].control.as_ref().unwrap().as_str(),
+            &(prefix.to_string() + "/track1")
+        );
+        assert_eq!(p.streams[1].media, "audio");
+        assert_eq!(p.streams[1].encoding_name, "pcma");
+        assert_eq!(p.streams[1].rtp_payload_type, 8);
+        assert_eq!(p.streams[1].clock_rate, 8_000);
+        assert_eq!(p.streams[1].channels, NonZeroU16::new(1));
+        match p.streams[1].parameters().unwrap() {
+            Parameters::Audio(_) => {}
+            _ => panic!(),
+        };
+    }
+
     /// [GW Security GW4089IP](https://github.com/scottlamb/moonfire-nvr/wiki/Cameras:-GW-Security#gw4089ip),
     /// main stream (high-res, audio).
     #[test]
@@ -999,7 +1046,7 @@ mod tests {
         // H.264 video stream.
         assert_eq!(
             p.streams[0].control.as_ref().unwrap().as_str(),
-            "rtsp://192.168.1.110:5050/video"
+            "rtsp://192.168.1.110:5050/H264?channel=1&subtype=0&unicast=true&proto=Onvif/video"
         );
         assert_eq!(p.streams[0].media, "video");
         assert_eq!(p.streams[0].encoding_name, "h264");
@@ -1018,7 +1065,7 @@ mod tests {
         // audio stream
         assert_eq!(
             p.streams[1].control.as_ref().unwrap().as_str(),
-            "rtsp://192.168.1.110:5050/audio"
+            "rtsp://192.168.1.110:5050/H264?channel=1&subtype=0&unicast=true&proto=Onvif/audio"
         );
         assert_eq!(p.streams[1].media, "audio");
         assert_eq!(p.streams[1].encoding_name, "pcmu"); // rtpmap wins over static list.
@@ -1055,14 +1102,15 @@ mod tests {
 
         // PLAY.
         super::parse_play(
-            response(include_bytes!("testdata/gw_main_play.txt")),
+            &response(include_bytes!("testdata/gw_main_play.txt")),
             &mut p,
         )
         .unwrap();
+        // The RTP-Info url= isn't in the expected format, so its contents are skipped.
         match &p.streams[0].state {
             StreamState::Init(s) => {
-                assert_eq!(s.initial_seq, Some(271));
-                assert_eq!(s.initial_rtptime, Some(1621990950));
+                assert_eq!(s.initial_seq, None);
+                assert_eq!(s.initial_rtptime, None);
             }
             _ => panic!(),
         };
@@ -1082,7 +1130,10 @@ mod tests {
         // DESCRIBE.
         let base = "rtsp://192.168.1.110:5049/H264?channel=1&subtype=1&unicast=true&proto=Onvif";
         let mut p = parse_describe(base, include_bytes!("testdata/gw_sub_describe.txt")).unwrap();
-        assert_eq!(p.control.as_str(), base);
+        assert_eq!(
+            p.control.as_str(),
+            "rtsp://192.168.1.110:5049/H264?channel=1&subtype=1&unicast=true&proto=Onvif"
+        );
         assert!(!p.accept_dynamic_rate);
 
         assert_eq!(p.streams.len(), 1);
@@ -1090,7 +1141,7 @@ mod tests {
         // H.264 video stream.
         assert_eq!(
             p.streams[0].control.as_ref().unwrap().as_str(),
-            "rtsp://192.168.1.110:5049/video"
+            "rtsp://192.168.1.110:5049/H264?channel=1&subtype=1&unicast=true&proto=Onvif/video"
         );
         assert_eq!(p.streams[0].media, "video");
         assert_eq!(p.streams[0].encoding_name, "h264");
@@ -1119,7 +1170,11 @@ mod tests {
         });
 
         // PLAY.
-        super::parse_play(response(include_bytes!("testdata/gw_sub_play.txt")), &mut p).unwrap();
+        super::parse_play(
+            &response(include_bytes!("testdata/gw_sub_play.txt")),
+            &mut p,
+        )
+        .unwrap();
         match &p.streams[0].state {
             StreamState::Init(s) => {
                 assert_eq!(s.initial_seq, Some(273));

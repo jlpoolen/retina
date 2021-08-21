@@ -2,22 +2,21 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::num::NonZeroU32;
+use std::task::Poll;
 use std::{borrow::Cow, fmt::Debug, num::NonZeroU16, pin::Pin};
 
 use self::channel_mapping::*;
-use self::timeline::Timeline;
-use async_stream::try_stream;
+pub use self::timeline::Timeline;
 use bytes::Bytes;
-use failure::{bail, format_err, Error};
-use futures::{SinkExt, StreamExt};
+use futures::{ready, Future, SinkExt, StreamExt};
 use log::{debug, trace, warn};
 use pin_project::pin_project;
 use sdp::session_description::SessionDescription;
 use tokio::pin;
-use tokio_util::codec::Framed;
 use url::Url;
 
-use crate::{codec::CodecItem, Context};
+use crate::codec::CodecItem;
+use crate::{Error, ErrorInt, RtspMessageContext};
 
 mod channel_mapping;
 mod parse;
@@ -59,12 +58,12 @@ impl Default for InitialTimestampPolicy {
 
 impl std::fmt::Display for InitialTimestampPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            InitialTimestampPolicy::Default => f.pad("default"),
-            InitialTimestampPolicy::Require => f.pad("require"),
-            InitialTimestampPolicy::Ignore => f.pad("ignore"),
-            InitialTimestampPolicy::Permissive => f.pad("permissive"),
-        }
+        f.pad(match self {
+            InitialTimestampPolicy::Default => "default",
+            InitialTimestampPolicy::Require => "require",
+            InitialTimestampPolicy::Ignore => "ignore",
+            InitialTimestampPolicy::Permissive => "permissive",
+        })
     }
 }
 
@@ -77,22 +76,79 @@ impl std::str::FromStr for InitialTimestampPolicy {
             "require" => InitialTimestampPolicy::Require,
             "ignore" => InitialTimestampPolicy::Ignore,
             "permissive" => InitialTimestampPolicy::Permissive,
-            _ => bail!("Initial timestamp mode {:?} not understood", s),
+            _ => bail!(ErrorInt::InvalidArgument(format!(
+                "bad InitialTimestampPolicy {}; \
+                 expected default, require, ignore or permissive",
+                s
+            ))),
         })
     }
 }
 
-/// Policy decisions to make on `PLAY`.
+/// Options which must be known right as a session is created.
+///
+/// Decisions which can be deferred are in [PlayOptions] instead.
+#[derive(Default)]
+pub struct SessionOptions {
+    creds: Option<Credentials>,
+    user_agent: String,
+    ignore_spurious_data: bool,
+}
+
+impl SessionOptions {
+    /// Ignores RTSP interleaved data packets for channels that aren't assigned,
+    /// aren't in PLAY state, or already have a different SSRC in use.
+    ///
+    /// This still assumes that for assigned channels, the packet's protocol
+    /// (RTP or RTCP) matches the assignment. All known RTSP implementations
+    /// only use RTP on even channels and RTCP on odd channels, so this seems
+    /// reasonably safe.
+    ///
+    /// ``ignore_spurious_data` is necessary with some Reolink cameras for at
+    /// least two reasons:
+    /// *  Reolink RLC-410 (IPC_3816M) firmware version v2.0.0.1441_19032101:
+    ///    the camera sent interleaved data that apparently belonged to a
+    ///    previous RTSP session. This happened immediately on connection
+    ///    establishment and continued for some time after the following PLAY
+    ///    request.
+    /// *  Reolink RLC-822A (IPC_523128M8MP) firmware v3.0.0.177_21012101):
+    ///    the camera sent RTCP SR packets immediately *before* its PLAY
+    ///    response rather than afterward. It's easiest to treat them similarly
+    ///    to the above case and discard them. (An alternative workaround would
+    ///    be to buffer them until after Retina has examined the server's
+    ///    PLAY response.)
+    ///
+    /// Currently each packet is logged at debug priority. This may change.
+    pub fn ignore_spurious_data(mut self, ignore_spurious_data: bool) -> Self {
+        self.ignore_spurious_data = ignore_spurious_data;
+        self
+    }
+
+    /// Use the given credentials when/if the server requests digest authentication.
+    pub fn creds(mut self, creds: Option<Credentials>) -> Self {
+        self.creds = creds;
+        self
+    }
+
+    /// Sends the given user agent string with each request.
+    pub fn user_agent(mut self, user_agent: String) -> Self {
+        self.user_agent = user_agent;
+        self
+    }
+}
+
+/// Options which must be decided at `PLAY` time.
 ///
 /// These are mostly adjustments for non-compliant server implementations.
+/// See also [SessionOptions] for options which must be decided earlier.
 #[derive(Default)]
-pub struct PlayPolicy {
+pub struct PlayOptions {
     initial_timestamp: InitialTimestampPolicy,
     ignore_zero_seq: bool,
     enforce_timestamps_with_max_jump_secs: Option<NonZeroU32>,
 }
 
-impl PlayPolicy {
+impl PlayOptions {
     pub fn initial_timestamp(self, initial_timestamp: InitialTimestampPolicy) -> Self {
         Self {
             initial_timestamp,
@@ -165,7 +221,7 @@ pub struct Stream {
     /// Number of audio channels, if applicable (`media` is `audio`) and known.
     pub channels: Option<NonZeroU16>,
 
-    depacketizer: Result<crate::codec::Depacketizer, Error>,
+    depacketizer: Result<crate::codec::Depacketizer, String>,
 
     /// The specified control URL.
     /// This is needed with multiple streams to send `SETUP` requests and
@@ -173,12 +229,6 @@ pub struct Stream {
     /// [RFC 2326 section C.3](https://datatracker.ietf.org/doc/html/rfc2326#appendix-C.3)
     /// says the server is allowed to omit it when there is only a single stream.
     pub control: Option<Url>,
-
-    /// Some buggy cameras expect the base URL to be interpreted as if it had an
-    /// implicit trailing slash. (This is approximately what ffmpeg 4.3.1 does
-    /// when the base URL has a query string.) If `RTP-Info` matching fails, try
-    /// again with this URL.
-    alt_control: Option<Url>,
 
     state: StreamState,
 }
@@ -188,7 +238,7 @@ impl Stream {
     ///
     /// Returns `None` on unknown codecs, bad parameters, or if parameters aren't specified
     /// via SDP. Some codecs allow parameters to be specified in-band instead.
-    pub fn parameters(&self) -> Option<&crate::codec::Parameters> {
+    pub fn parameters(&self) -> Option<crate::codec::Parameters> {
         self.depacketizer.as_ref().ok().and_then(|d| d.parameters())
     }
 }
@@ -240,25 +290,46 @@ pub struct Credentials {
 /// `DESCRIBE` changes the connection's state such that another one will fail,
 /// before assigning a session id. Thus [Session] represents something more like
 /// an RTSP connection than an RTSP session.
+#[doc(hidden)]
 pub trait State {}
 
-/// Initial state after a `DESCRIBE`.
+/// Initial state after a `DESCRIBE`; use via `Session<Described>`.
 /// One or more `SETUP`s may have also been issued, in which case a `session_id`
 /// will be assigned.
+#[doc(hidden)]
 pub struct Described {
     presentation: Presentation,
     session_id: Option<String>,
     channels: ChannelMappings,
+
+    // Keep some information about the DESCRIBE response. If a depacketizer
+    // couldn't be constructed correctly for one or more streams, this will be
+    // used to create a RtspResponseError on `State<Playing>::demuxed()`.
+    // We defer such errors from DESCRIBE time until then because they only
+    // matter if the stream is setup and the caller wants depacketization.
+    describe_ctx: RtspMessageContext,
+    describe_cseq: u32,
+    describe_status: rtsp_types::StatusCode,
 }
 impl State for Described {}
 
-/// State after a `PLAY`.
+enum KeepaliveState {
+    Idle,
+    Flushing(u32),
+    Waiting(u32),
+}
+
+/// State after a `PLAY`; use via `Session<Playing>`.
+#[doc(hidden)]
 #[pin_project(project = PlayingProj)]
 pub struct Playing {
     presentation: Presentation,
     session_id: String,
     channels: ChannelMappings,
-    pending_keepalive_cseq: Option<u32>,
+    keepalive_state: KeepaliveState,
+    describe_ctx: RtspMessageContext,
+    describe_cseq: u32,
+    describe_status: rtsp_types::StatusCode,
 
     #[pin]
     keepalive_timer: tokio::time::Sleep,
@@ -267,10 +338,9 @@ impl State for Playing {}
 
 /// The raw connection, without tracking session state.
 struct RtspConnection {
-    creds: Option<Credentials>,
+    options: SessionOptions,
     requested_auth: Option<digest_auth::WwwAuthenticateHeader>,
-    stream: Framed<tokio::net::TcpStream, crate::Codec>,
-    user_agent: String,
+    inner: crate::tokio::Connection,
 
     /// The next `CSeq` header value to use when sending an RTSP request.
     next_cseq: u32,
@@ -287,45 +357,36 @@ pub struct Session<S: State> {
 }
 
 impl RtspConnection {
-    async fn connect(url: &Url, creds: Option<Credentials>) -> Result<Self, Error> {
+    async fn connect(url: &Url, options: SessionOptions) -> Result<Self, Error> {
+        let host =
+            RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
+        let port = url.port().unwrap_or(554);
+        let inner = crate::tokio::Connection::connect(host, port)
+            .await
+            .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
+        Ok(Self {
+            inner,
+            options,
+            requested_auth: None,
+            next_cseq: 1,
+        })
+    }
+
+    fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
         if url.scheme() != "rtsp" {
-            bail!("Only rtsp urls supported (no rtsps yet)");
+            return Err(format!(
+                "Bad URL {}; only scheme rtsp supported",
+                url.as_str()
+            ));
         }
         if url.username() != "" || url.password().is_some() {
             // Url apparently doesn't even have a way to clear the credentials,
             // so this has to be an error.
-            bail!("URL must not contain credentials");
+            // TODO: that's not true; revisit this.
+            return Err("URL must not contain credentials".to_owned());
         }
-        let host = url
-            .host_str()
-            .ok_or_else(|| format_err!("Must specify host in rtsp url {}", &url))?;
-        let port = url.port().unwrap_or(554);
-        let stream = tokio::net::TcpStream::connect((host, port)).await?;
-        let conn_established_wall = time::get_time();
-        let conn_established = std::time::Instant::now();
-        let conn_local_addr = stream.local_addr()?;
-        let conn_peer_addr = stream.peer_addr()?;
-        let stream = Framed::new(
-            stream,
-            crate::Codec {
-                ctx: crate::Context {
-                    conn_established_wall,
-                    conn_established,
-                    conn_local_addr,
-                    conn_peer_addr,
-                    msg_pos: 0,
-                    msg_received_wall: conn_established_wall,
-                    msg_received: conn_established,
-                },
-            },
-        );
-        Ok(Self {
-            creds,
-            requested_auth: None,
-            stream,
-            user_agent: "moonfire-rtsp test".to_string(),
-            next_cseq: 1,
-        })
+        url.host()
+            .ok_or_else(|| format!("Must specify host in rtsp url {}", &url))
     }
 
     /// Sends a request and expects the next message from the peer to be its response.
@@ -333,109 +394,207 @@ impl RtspConnection {
     async fn send(
         &mut self,
         req: &mut rtsp_types::Request<Bytes>,
-    ) -> Result<rtsp_types::Response<Bytes>, Error> {
+    ) -> Result<(RtspMessageContext, u32, rtsp_types::Response<Bytes>), Error> {
         loop {
-            let cseq = self.send_nowait(req).await?;
-            let msg = self
-                .stream
-                .next()
+            let cseq = self.fill_req(req)?;
+            self.inner
+                .send(rtsp_types::Message::Request(req.clone()))
                 .await
-                .ok_or_else(|| format_err!("unexpected EOF while waiting for reply"))??;
-            let resp = match msg.msg {
-                rtsp_types::Message::Response(r) => r,
-                o => bail!("Unexpected RTSP message {:?}", &o),
+                .map_err(|e| wrap!(e))?;
+            let method: &str = req.method().into();
+            let (resp, msg_ctx) = loop {
+                let msg = self.inner.next().await.unwrap_or_else(|| {
+                    bail!(ErrorInt::ReadError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx: self.inner.eof_ctx(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!("EOF while expecting reply to {} CSeq {}", method, cseq),
+                        ),
+                    })
+                })?;
+                match msg.msg {
+                    rtsp_types::Message::Response(r) if parse::get_cseq(&r) == Some(cseq) => {
+                        break (r, msg.ctx)
+                    }
+                    rtsp_types::Message::Data(d) if self.options.ignore_spurious_data => {
+                        debug!(
+                            "ignoring interleaved data message on channel {} while waiting \
+                                for reply to {} CSeq {}",
+                            d.channel_id(),
+                            method,
+                            cseq
+                        );
+                        continue;
+                    }
+                    o => bail!(ErrorInt::RtspFramingError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx: msg.ctx,
+                        description: format!(
+                            "Expected reply to {} CSeq {}, got {:?}",
+                            method, cseq, o,
+                        ),
+                    }),
+                };
             };
-            if parse::get_cseq(&resp) != Some(cseq) {
-                bail!(
-                    "didn't get expected CSeq {:?} on {:?} at {:#?}",
-                    &cseq,
-                    &resp,
-                    &msg.ctx
-                );
-            }
             if resp.status() == rtsp_types::StatusCode::Unauthorized {
                 if self.requested_auth.is_some() {
-                    bail!(
-                        "Received Unauthorized after trying digest auth at {:#?}",
-                        &msg.ctx
-                    );
+                    // TODO: the WWW-Authenticate might indicate a new domain or nonce.
+                    // In that case, we should retry rather than returning error.
+                    bail!(ErrorInt::RtspResponseError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx,
+                        method: req.method().clone(),
+                        cseq,
+                        status: resp.status(),
+                        description: "Received Unauthorized after trying digest auth".into(),
+                    })
                 }
                 let www_authenticate = match resp.header(&rtsp_types::headers::WWW_AUTHENTICATE) {
-                    None => bail!(
-                        "Unauthorized without WWW-Authenticate header at {:#?}",
-                        &msg.ctx
-                    ),
+                    None => bail!(ErrorInt::RtspResponseError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx,
+                        method: req.method().clone(),
+                        cseq,
+                        status: resp.status(),
+                        description: "Unauthorized without WWW-Authenticate header".into(),
+                    }),
                     Some(h) => h,
                 };
                 let www_authenticate = www_authenticate.as_str();
                 if !www_authenticate.starts_with("Digest ") {
-                    bail!(
-                        "Non-digest authentication requested at {:#?}: {}",
-                        &msg.ctx,
-                        www_authenticate
-                    );
+                    // TODO: the header(s) might also indicate both Basic and Digest; we shouldn't
+                    // error or not based on ordering.
+                    bail!(ErrorInt::RtspResponseError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx,
+                        method: req.method().clone(),
+                        cseq,
+                        status: resp.status(),
+                        description: format!(
+                            "Non-digest authentication requested: {}",
+                            www_authenticate
+                        ),
+                    })
                 }
-                let www_authenticate = digest_auth::WwwAuthenticateHeader::parse(www_authenticate)?;
+                if self.options.creds.is_none() {
+                    bail!(ErrorInt::RtspResponseError {
+                        conn_ctx: *self.inner.ctx(),
+                        msg_ctx,
+                        method: req.method().clone(),
+                        cseq,
+                        status: resp.status(),
+                        description: "Authentication requested and no credentials supplied"
+                            .to_owned(),
+                    })
+                }
+                let www_authenticate = digest_auth::WwwAuthenticateHeader::parse(www_authenticate)
+                    .map_err(|e| {
+                        wrap!(ErrorInt::RtspResponseError {
+                            conn_ctx: *self.inner.ctx(),
+                            msg_ctx,
+                            method: req.method().clone(),
+                            cseq,
+                            status: resp.status(),
+                            description: format!(
+                                "Bad WWW-Authenticate header {:?}: {}",
+                                www_authenticate, e
+                            ),
+                        })
+                    })?;
                 self.requested_auth = Some(www_authenticate);
                 continue;
             } else if !resp.status().is_success() {
-                bail!(
-                    "RTSP {:?} request returned {} at {:#?}",
-                    req.method(),
-                    resp.status(),
-                    &msg.ctx
-                );
+                bail!(ErrorInt::RtspResponseError {
+                    conn_ctx: *self.inner.ctx(),
+                    msg_ctx,
+                    method: req.method().clone(),
+                    cseq,
+                    status: resp.status(),
+                    description: "Unexpected RTSP response status".into(),
+                });
             }
-            return Ok(resp);
+            return Ok((msg_ctx, cseq, resp));
         }
     }
 
-    /// Sends a request without waiting for a response, returning the `CSeq`.
-    async fn send_nowait(&mut self, req: &mut rtsp_types::Request<Bytes>) -> Result<u32, Error> {
+    /// Fills out `req` with authorization and `CSeq` headers.
+    fn fill_req(&mut self, req: &mut rtsp_types::Request<Bytes>) -> Result<u32, Error> {
         let cseq = self.next_cseq;
         self.next_cseq += 1;
-        match (self.requested_auth.as_mut(), self.creds.as_ref()) {
-            (None, _) => {}
-            (Some(auth), Some(creds)) => {
-                let uri = req.request_uri().map(|u| u.as_str()).unwrap_or("*");
-                let method = digest_auth::HttpMethod(Cow::Borrowed(req.method().into()));
-                let ctx = digest_auth::AuthContext::new_with_method(
-                    &creds.username,
-                    &creds.password,
-                    uri,
-                    Option::<&'static [u8]>::None,
-                    method,
-                );
-                let authorization = auth.respond(&ctx)?.to_string();
-                req.insert_header(rtsp_types::headers::AUTHORIZATION, authorization);
-            }
-            (Some(_), None) => bail!("Authentication required; no credentials supplied"),
+        if let Some(ref mut auth) = self.requested_auth {
+            let creds = self
+                .options
+                .creds
+                .as_ref()
+                .expect("creds were checked when filling request_auth");
+            let uri = req.request_uri().map(|u| u.as_str()).unwrap_or("*");
+            let method = digest_auth::HttpMethod(Cow::Borrowed(req.method().into()));
+            let ctx = digest_auth::AuthContext::new_with_method(
+                &creds.username,
+                &creds.password,
+                uri,
+                Option::<&'static [u8]>::None,
+                method,
+            );
+
+            // digest_auth's comments seem to say 'respond' failing means a parser bug.
+            let authorization = auth
+                .respond(&ctx)
+                .map_err(|e| wrap!(ErrorInt::Internal(e.into())))?
+                .to_string();
+            req.insert_header(rtsp_types::headers::AUTHORIZATION, authorization);
         }
         req.insert_header(rtsp_types::headers::CSEQ, cseq.to_string());
-        req.insert_header(rtsp_types::headers::USER_AGENT, self.user_agent.clone());
-        self.stream
-            .send(rtsp_types::Message::Request(req.clone()))
-            .await?;
+        if !self.options.user_agent.is_empty() {
+            req.insert_header(
+                rtsp_types::headers::USER_AGENT,
+                self.options.user_agent.clone(),
+            );
+        }
         Ok(cseq)
     }
 }
 
 impl Session<Described> {
-    pub async fn describe(url: Url, creds: Option<Credentials>) -> Result<Self, Error> {
-        let mut conn = RtspConnection::connect(&url, creds).await?;
+    /// Creates a new session from a `DESCRIBE` request on the given URL.
+    ///
+    /// This method is permissive; it will return success even if there are
+    /// errors in the SDP that would prevent one or more streams from being
+    /// depacketized correctly. If those streams are setup via
+    /// `Session<Described>::setup`, the erorrs in question will be ultimately
+    /// returned from `Stream<Playing>::demuxed`.
+    pub async fn describe(url: Url, options: SessionOptions) -> Result<Self, Error> {
+        let conn = RtspConnection::connect(&url, options).await?;
+        Self::describe_with_conn(conn, url).await
+    }
+
+    async fn describe_with_conn(mut conn: RtspConnection, url: Url) -> Result<Self, Error> {
         let mut req =
             rtsp_types::Request::builder(rtsp_types::Method::Describe, rtsp_types::Version::V1_0)
                 .header(rtsp_types::headers::ACCEPT, "application/sdp")
                 .request_uri(url.clone())
                 .build(Bytes::new());
-        let response = conn.send(&mut req).await?;
-        let presentation = parse::parse_describe(url, response)?;
+        let (msg_ctx, cseq, response) = conn.send(&mut req).await?;
+        let presentation = parse::parse_describe(url, &response).map_err(|description| {
+            wrap!(ErrorInt::RtspResponseError {
+                conn_ctx: *conn.inner.ctx(),
+                msg_ctx,
+                method: rtsp_types::Method::Describe,
+                cseq,
+                status: response.status(),
+                description,
+            })
+        })?;
         Ok(Session {
             conn,
             state: Described {
                 presentation,
                 session_id: None,
                 channels: ChannelMappings::default(),
+                describe_ctx: msg_ctx,
+                describe_cseq: cseq,
+                describe_status: response.status(),
             },
         })
     }
@@ -445,6 +604,7 @@ impl Session<Described> {
     }
 
     /// Sends a `SETUP` request for a stream.
+    ///
     /// Note these can't reasonably be pipelined because subsequent requests
     /// are expected to adopt the previous response's `Session`. Likewise,
     /// the server may override the preferred interleaved channel id and it
@@ -455,9 +615,13 @@ impl Session<Described> {
     pub async fn setup(&mut self, stream_i: usize) -> Result<(), Error> {
         let stream = &mut self.state.presentation.streams[stream_i];
         if !matches!(stream.state, StreamState::Uninit) {
-            bail!("stream already set up");
+            bail!(ErrorInt::FailedPrecondition("stream already set up".into()));
         }
-        let proposed_channel_id = self.state.channels.next_unassigned()?;
+        let proposed_channel_id = self.state.channels.next_unassigned().ok_or_else(|| {
+            wrap!(ErrorInt::FailedPrecondition(
+                "no unassigned channels".into()
+            ))
+        })?;
         let url = stream
             .control
             .as_ref()
@@ -478,21 +642,51 @@ impl Session<Described> {
         if let Some(ref s) = self.state.session_id {
             req = req.header(rtsp_types::headers::SESSION, s.clone());
         }
-        let response = self.conn.send(&mut req.build(Bytes::new())).await?;
+        let (msg_ctx, cseq, response) = self.conn.send(&mut req.build(Bytes::new())).await?;
         debug!("SETUP response: {:#?}", &response);
-        let response = parse::parse_setup(&response)?;
+        let conn_ctx = self.conn.inner.ctx();
+        let status = response.status();
+        let response = parse::parse_setup(&response).map_err(|description| {
+            wrap!(ErrorInt::RtspResponseError {
+                conn_ctx: *conn_ctx,
+                msg_ctx,
+                method: rtsp_types::Method::Setup,
+                cseq,
+                status,
+                description,
+            })
+        })?;
         match self.state.session_id.as_ref() {
             Some(old) if old != response.session_id => {
-                bail!(
-                    "SETUP response changed session id from {:?} to {:?}",
-                    old,
-                    response.session_id
-                );
+                bail!(ErrorInt::RtspResponseError {
+                    conn_ctx: *self.conn.inner.ctx(),
+                    msg_ctx,
+                    method: rtsp_types::Method::Setup,
+                    cseq,
+                    status,
+                    description: format!(
+                        "session id changed from {:?} to {:?}",
+                        old, response.session_id,
+                    ),
+                });
             }
             Some(_) => {}
             None => self.state.session_id = Some(response.session_id.to_owned()),
         };
-        self.state.channels.assign(response.channel_id, stream_i)?;
+        let conn_ctx = self.conn.inner.ctx();
+        self.state
+            .channels
+            .assign(response.channel_id, stream_i)
+            .map_err(|description| {
+                wrap!(ErrorInt::RtspResponseError {
+                    conn_ctx: *conn_ctx,
+                    msg_ctx,
+                    method: rtsp_types::Method::Setup,
+                    cseq,
+                    status,
+                    description,
+                })
+            })?;
         stream.state = StreamState::Init(StreamStateInit {
             ssrc: response.ssrc,
             initial_seq: None,
@@ -502,16 +696,17 @@ impl Session<Described> {
     }
 
     /// Sends a `PLAY` request for the entire presentation.
+    ///
     /// The presentation must support aggregate control, as defined in [RFC 2326
     /// section 1.3](https://tools.ietf.org/html/rfc2326#section-1.3).
-    pub async fn play(mut self, policy: PlayPolicy) -> Result<Session<Playing>, Error> {
-        let session_id = self
-            .state
-            .session_id
-            .take()
-            .ok_or_else(|| format_err!("must SETUP before PLAY"))?;
+    pub async fn play(mut self, policy: PlayOptions) -> Result<Session<Playing>, Error> {
+        let session_id = self.state.session_id.take().ok_or_else(|| {
+            wrap!(ErrorInt::FailedPrecondition(
+                "must SETUP before PLAY".into()
+            ))
+        })?;
         trace!("PLAY with channel mappings: {:#?}", &self.state.channels);
-        let response = self
+        let (msg_ctx, cseq, response) = self
             .conn
             .send(
                 &mut rtsp_types::Request::builder(
@@ -524,7 +719,16 @@ impl Session<Described> {
                 .build(Bytes::new()),
             )
             .await?;
-        parse::parse_play(response, &mut self.state.presentation)?;
+        parse::parse_play(&response, &mut self.state.presentation).map_err(|description| {
+            wrap!(ErrorInt::RtspResponseError {
+                conn_ctx: *self.conn.inner.ctx(),
+                msg_ctx,
+                method: rtsp_types::Method::Play,
+                cseq,
+                status: response.status(),
+                description,
+            })
+        })?;
 
         // Count how many streams have been setup (not how many are in the presentation).
         let setup_streams = self
@@ -557,27 +761,34 @@ impl Session<Described> {
                     ssrc,
                     ..
                 }) => {
-                    let initial_rtptime =
-                        match policy.initial_timestamp {
-                            InitialTimestampPolicy::Require | InitialTimestampPolicy::Default
-                                if setup_streams > 1 =>
-                            {
-                                if initial_rtptime.is_none() {
-                                    bail!(
-                                    "Expected rtptime on PLAY with mode {:?}, missing on stream \
-                                     {} ({:?}). Consider setting initial timestamp mode \
-                                     use-if-all-present.",
-                                    policy.initial_timestamp, i, &s.control);
-                                }
-                                initial_rtptime
+                    let initial_rtptime = match policy.initial_timestamp {
+                        InitialTimestampPolicy::Require | InitialTimestampPolicy::Default
+                            if setup_streams > 1 =>
+                        {
+                            if initial_rtptime.is_none() {
+                                bail!(ErrorInt::RtspResponseError {
+                                    conn_ctx: *self.conn.inner.ctx(),
+                                    msg_ctx,
+                                    method: rtsp_types::Method::Play,
+                                    cseq,
+                                    status: response.status(),
+                                    description: format!(
+                                        "Expected rtptime on PLAY with mode {:?}, missing on \
+                                             stream {} ({:?}). Consider setting initial timestamp \
+                                             mode use-if-all-present.",
+                                        policy.initial_timestamp, i, &s.control
+                                    ),
+                                });
                             }
-                            InitialTimestampPolicy::Permissive
-                                if setup_streams > 1 && all_have_time =>
-                            {
-                                initial_rtptime
-                            }
-                            _ => None,
-                        };
+                            initial_rtptime
+                        }
+                        InitialTimestampPolicy::Permissive
+                            if setup_streams > 1 && all_have_time =>
+                        {
+                            initial_rtptime
+                        }
+                        _ => None,
+                    };
                     let initial_seq = match initial_seq {
                         Some(0) if policy.ignore_zero_seq => {
                             log::info!("Ignoring seq=0 on stream {}", i);
@@ -585,12 +796,23 @@ impl Session<Described> {
                         }
                         o => o,
                     };
+                    let conn_ctx = self.conn.inner.ctx();
                     s.state = StreamState::Playing {
                         timeline: Timeline::new(
                             initial_rtptime,
                             s.clock_rate,
                             policy.enforce_timestamps_with_max_jump_secs,
-                        )?,
+                        )
+                        .map_err(|description| {
+                            wrap!(ErrorInt::RtspResponseError {
+                                conn_ctx: *conn_ctx,
+                                msg_ctx,
+                                method: rtsp_types::Method::Play,
+                                cseq,
+                                status: response.status(),
+                                description,
+                            })
+                        })?,
                         rtp_handler: rtp::StrictSequenceChecker::new(ssrc, initial_seq),
                     };
                 }
@@ -604,152 +826,106 @@ impl Session<Described> {
                 presentation: self.state.presentation,
                 session_id,
                 channels: self.state.channels,
+                keepalive_state: KeepaliveState::Idle,
                 keepalive_timer: tokio::time::sleep(KEEPALIVE_DURATION),
-                pending_keepalive_cseq: None,
+                describe_ctx: self.state.describe_ctx,
+                describe_cseq: self.state.describe_cseq,
+                describe_status: self.state.describe_status,
             },
         })
     }
 }
 
+#[derive(Debug)]
 pub enum PacketItem {
     RtpPacket(rtp::Packet),
     SenderReport(rtp::SenderReport),
 }
 
 impl Session<Playing> {
-    /// Returns a stream of packets.
-    pub fn pkts(self) -> impl futures::Stream<Item = Result<PacketItem, Error>> {
-        try_stream! {
-            let self_ = self;
-            tokio::pin!(self_);
-            while let Some(pkt) = self_.as_mut().next().await {
-                let pkt = pkt?;
-                yield pkt;
-            }
-        }
-    }
-
-    pub fn demuxed(
-        mut self,
-    ) -> Result<impl futures::Stream<Item = Result<CodecItem, Error>>, Error> {
+    /// Returns a wrapper which demuxes/depacketizes into frames.
+    ///
+    /// Fails if a stream that has been setup can't be depacketized.
+    pub fn demuxed(mut self) -> Result<Demuxed, Error> {
         for s in &mut self.state.presentation.streams {
             if matches!(s.state, StreamState::Playing { .. }) {
-                if let Err(ref mut e) = s.depacketizer {
-                    return Err(std::mem::replace(e, format_err!("(placeholder)")));
+                if let Err(ref description) = s.depacketizer {
+                    bail!(ErrorInt::RtspResponseError {
+                        conn_ctx: *self.conn.inner.ctx(),
+                        msg_ctx: self.state.describe_ctx,
+                        method: rtsp_types::Method::Describe,
+                        cseq: self.state.describe_cseq,
+                        status: self.state.describe_status,
+                        description: description.clone(),
+                    });
                 }
             }
         }
-        Ok(try_stream! {
-            let self_ = self;
-            tokio::pin!(self_);
-            while let Some(pkt) = self_.as_mut().next().await {
-                let pkt = pkt?;
-                match pkt {
-                    PacketItem::RtpPacket(p) => {
-                        let self_ = self_.as_mut().project();
-                        let state = self_.state.project();
-                        let depacketizer = match &mut state.presentation.streams[p.stream_id].depacketizer {
-                            Ok(d) => d,
-                            Err(_) => unreachable!("depacketizer was Ok"),
-                        };
-                        depacketizer.push(p)?;
-                        while let Some(demuxed) = depacketizer.pull()? {
-                            yield demuxed;
-                        }
-                    },
-                    PacketItem::SenderReport(p) => yield CodecItem::SenderReport(p),
-                };
-            }
+        Ok(Demuxed {
+            state: DemuxedState::Waiting,
+            session: self,
         })
     }
 
-    /// Returns the next packet, an error, or `None` on end of stream.
-    /// Also manages keepalives; this will send them as necessary to keep the
-    /// stream open, and fail when sending a following keepalive if the
-    /// previous one was never acknowledged.
-    ///
-    /// TODO: this should also pass along RTCP packets. There can be multiple
-    /// RTCP packets per data message, so that will require keeping more state.
-    async fn next(self: Pin<&mut Self>) -> Option<Result<PacketItem, Error>> {
-        let this = self.project();
-        let mut state = this.state.project();
-        loop {
-            tokio::select! {
-                // Prefer receiving data to sending keepalives. If we can't keep
-                // up with the server's data stream, it probably should drop us.
-                biased;
-
-                msg = this.conn.stream.next() => {
-                    let msg = match msg {
-                        Some(Ok(m)) => m,
-                        Some(Err(e)) => return Some(Err(e)),
-                        None => return None,
-                    };
-                    match msg.msg {
-                        rtsp_types::Message::Data(data) => {
-                            match Session::handle_data(&mut state, msg.ctx, data) {
-                                Err(e) => return Some(Err(e)),
-                                Ok(Some(pkt)) => return Some(Ok(pkt)),
-                                Ok(None) => continue,
-                            };
-                        },
-                        rtsp_types::Message::Response(response) => {
-                            if let Err(e) = Session::handle_response(&mut state, response) {
-                                return Some(Err(e));
-                            }
-                        },
-                        rtsp_types::Message::Request(request) => {
-                            warn!("Received RTSP request in Playing state. Responding unimplemented.\n{:#?}",
-                                request);
-                        },
-                    }
-                },
-
-                () = &mut state.keepalive_timer => {
-                    // TODO: deadlock possibility. Once we decide to send a
-                    // keepalive, we don't try receiving anything until the
-                    // keepalive is fully sent. The server might similarly be
-                    // stubbornly trying to send before receiving. If all the
-                    // socket buffers are full, deadlock can result.
-                    //
-                    // This is really unlikely right now when all we send are
-                    // keepalives, which are probably much smaller than our send
-                    // buffer. But if we start supporting ONVIF backchannel, it
-                    // will become more of a concern.
-                    if let Err(e) = Session::handle_keepalive_timer(this.conn, &mut state).await {
-                        return Some(Err(e));
-                    }
-                },
-            }
-        }
-    }
-
-    async fn handle_keepalive_timer(
+    fn handle_keepalive_timer(
         conn: &mut RtspConnection,
         state: &mut PlayingProj<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> Result<(), Error> {
-        // Check on the previous keepalive request.
-        if let Some(cseq) = state.pending_keepalive_cseq {
-            bail!(
-                "Server failed to respond to keepalive {} within {:?}",
-                cseq,
-                KEEPALIVE_DURATION
-            );
+        // Expect the previous keepalive request to have finished.
+        match state.keepalive_state {
+            KeepaliveState::Flushing(cseq) => bail!(ErrorInt::WriteError {
+                conn_ctx: *conn.inner.ctx(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "Unable to write keepalive {} within {:?}",
+                        cseq, KEEPALIVE_DURATION,
+                    ),
+                ),
+            }),
+            KeepaliveState::Waiting(cseq) => bail!(ErrorInt::ReadError {
+                conn_ctx: *conn.inner.ctx(),
+                msg_ctx: conn.inner.eof_ctx(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "Server failed to respond to keepalive {} within {:?}",
+                        cseq, KEEPALIVE_DURATION,
+                    ),
+                ),
+            }),
+            KeepaliveState::Idle => {}
+        }
+
+        // Currently the only outbound data should be keepalives, and the previous one
+        // has already been flushed, so there's no reason the Sink shouldn't be ready.
+        if matches!(conn.inner.poll_ready_unpin(cx), Poll::Pending) {
+            bail!(ErrorInt::Internal(
+                "Unexpectedly not ready to send keepalive".into()
+            ));
         }
 
         // Send a new one and reset the timer.
-        *state.pending_keepalive_cseq = Some(
-            conn.send_nowait(
-                &mut rtsp_types::Request::builder(
-                    rtsp_types::Method::GetParameter,
-                    rtsp_types::Version::V1_0,
-                )
-                .request_uri(state.presentation.base_url.clone())
-                .header(rtsp_types::headers::SESSION, state.session_id.clone())
-                .build(Bytes::new()),
-            )
-            .await?,
-        );
+        // Use a SET_PARAMETER with no body for keepalives, as recommended in the
+        // ONVIF Streaming Specification version version 21.06 section 5.2.2.2.
+        let mut req = rtsp_types::Request::builder(
+            rtsp_types::Method::SetParameter,
+            rtsp_types::Version::V1_0,
+        )
+        .request_uri(state.presentation.base_url.clone())
+        .header(rtsp_types::headers::SESSION, state.session_id.clone())
+        .build(Bytes::new());
+        let cseq = conn.fill_req(&mut req)?;
+        conn.inner
+            .start_send_unpin(rtsp_types::Message::Request(req))
+            .expect("encoding is infallible");
+        *state.keepalive_state = match conn.inner.poll_flush_unpin(cx) {
+            Poll::Ready(Ok(())) => KeepaliveState::Waiting(cseq),
+            Poll::Ready(Err(e)) => bail!(e),
+            Poll::Pending => KeepaliveState::Flushing(cseq),
+        };
+
         state
             .keepalive_timer
             .as_mut()
@@ -759,29 +935,47 @@ impl Session<Playing> {
 
     fn handle_response(
         state: &mut PlayingProj<'_>,
+        conn: &RtspConnection,
+        msg_ctx: &crate::RtspMessageContext,
         response: rtsp_types::Response<Bytes>,
     ) -> Result<(), Error> {
-        if matches!(*state.pending_keepalive_cseq,
-                    Some(cseq) if parse::get_cseq(&response) == Some(cseq))
+        if matches!(*state.keepalive_state,
+                    KeepaliveState::Waiting(cseq) if parse::get_cseq(&response) == Some(cseq))
         {
             // We don't care if the keepalive response succeeds or fails. Just mark complete.
-            *state.pending_keepalive_cseq = None;
+            *state.keepalive_state = KeepaliveState::Idle;
             return Ok(());
         }
 
         // The only response we expect in this state is to our keepalive request.
-        bail!("Unexpected RTSP response {:#?}", response);
+        bail!(ErrorInt::RtspFramingError {
+            conn_ctx: *conn.inner.ctx(),
+            msg_ctx: *msg_ctx,
+            description: format!("Unexpected RTSP response {:#?}", response),
+        })
     }
 
     fn handle_data(
         state: &mut PlayingProj<'_>,
-        ctx: Context,
+        conn: &RtspConnection,
+        msg_ctx: &RtspMessageContext,
         data: rtsp_types::Data<Bytes>,
     ) -> Result<Option<PacketItem>, Error> {
-        let c = data.channel_id();
-        let m = match state.channels.lookup(c) {
+        let channel_id = data.channel_id();
+        let m = match state.channels.lookup(channel_id) {
             Some(m) => m,
-            None => bail!("Data message on unexpected channel {} at {:#?}", c, &ctx),
+            None if conn.options.ignore_spurious_data => {
+                log::debug!(
+                    "Ignoring interleaved data on unassigned channel id {}",
+                    channel_id
+                );
+                return Ok(None);
+            }
+            None => bail!(ErrorInt::RtspUnassignedChannelError {
+                conn_ctx: *conn.inner.ctx(),
+                msg_ctx: *msg_ctx,
+                channel_id,
+            }),
         };
         let stream = &mut state.presentation.streams[m.stream_i];
         let (mut timeline, rtp_handler) = match &mut stream.state {
@@ -789,22 +983,418 @@ impl Session<Playing> {
                 timeline,
                 rtp_handler,
             } => (timeline, rtp_handler),
-            _ => unreachable!("Session<Playing>'s {}->{:?} not in Playing state", c, m),
+            _ => unreachable!(
+                "Session<Playing>'s {}->{:?} not in Playing state",
+                channel_id, m
+            ),
         };
         match m.channel_type {
-            ChannelType::Rtp => Ok(Some(rtp_handler.rtp(
-                ctx,
+            ChannelType::Rtp => Ok(rtp_handler.rtp(
+                &conn.options,
+                conn.inner.ctx(),
+                msg_ctx,
                 &mut timeline,
+                channel_id,
                 m.stream_i,
                 data.into_body(),
-            )?)),
-            ChannelType::Rtcp => {
-                Ok(rtp_handler.rtcp(ctx, &mut timeline, m.stream_i, data.into_body())?)
-            }
+            )?),
+            ChannelType::Rtcp => rtp_handler
+                .rtcp(
+                    &conn.options,
+                    msg_ctx,
+                    &mut timeline,
+                    m.stream_i,
+                    data.into_body(),
+                )
+                .map_err(|description| {
+                    wrap!(ErrorInt::RtspDataMessageError {
+                        conn_ctx: *conn.inner.ctx(),
+                        msg_ctx: *msg_ctx,
+                        channel_id,
+                        stream_id: m.stream_i,
+                        description,
+                    })
+                }),
         }
     }
 
     pub fn streams(&self) -> &[Stream] {
         &self.state.presentation.streams
+    }
+}
+
+impl futures::Stream for Session<Playing> {
+    type Item = Result<PacketItem, Error>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.project();
+        let mut state = this.state.project();
+        loop {
+            // First try receiving data. Let this starve keepalive handling; if we can't keep up,
+            // the server should probably drop us.
+            match Pin::new(&mut this.conn.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(msg))) => match msg.msg {
+                    rtsp_types::Message::Data(data) => {
+                        match Session::handle_data(&mut state, &this.conn, &msg.ctx, data) {
+                            Err(e) => return Poll::Ready(Some(Err(e))),
+                            Ok(Some(pkt)) => return Poll::Ready(Some(Ok(pkt))),
+                            Ok(None) => continue,
+                        };
+                    }
+                    rtsp_types::Message::Response(response) => {
+                        if let Err(e) =
+                            Session::handle_response(&mut state, &this.conn, &msg.ctx, response)
+                        {
+                            return Poll::Ready(Some(Err(e)));
+                        }
+                        continue;
+                    }
+                    rtsp_types::Message::Request(request) => {
+                        warn!("Received RTSP request in Playing state. Responding unimplemented.\n{:#?}",
+                            request);
+                    }
+                },
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                std::task::Poll::Pending => {}
+            }
+
+            // Then check if it's time for a new keepalive.
+            if matches!(state.keepalive_timer.as_mut().poll(cx), Poll::Ready(())) {
+                Session::handle_keepalive_timer(this.conn, &mut state, cx)?;
+            }
+
+            // Then finish flushing the current keepalive if necessary.
+            if let KeepaliveState::Flushing(cseq) = state.keepalive_state {
+                match this.conn.inner.poll_flush_unpin(cx) {
+                    Poll::Ready(Ok(())) => *state.keepalive_state = KeepaliveState::Waiting(*cseq),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error(Box::new(e))))),
+                    Poll::Pending => {}
+                }
+            }
+
+            // Nothing to do. The poll calls above have already registered cx as necessary.
+            return Poll::Pending;
+        }
+    }
+}
+
+enum DemuxedState {
+    Waiting,
+    Pulling(usize),
+    Fused,
+}
+
+/// Wrapper returned by [`Session<Playing>::demuxed`] which demuxes/depacketizes into frames.
+#[pin_project]
+pub struct Demuxed {
+    state: DemuxedState,
+    #[pin]
+    session: Session<Playing>,
+}
+
+impl futures::Stream for Demuxed {
+    type Item = Result<CodecItem, Error>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        loop {
+            let (stream_id, pkt) = match this.state {
+                DemuxedState::Waiting => match ready!(this.session.as_mut().poll_next(cx)) {
+                    Some(Ok(PacketItem::RtpPacket(p))) => (p.stream_id, Some(p)),
+                    Some(Ok(PacketItem::SenderReport(p))) => {
+                        return Poll::Ready(Some(Ok(CodecItem::SenderReport(p))))
+                    }
+                    Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                    None => return Poll::Ready(None),
+                },
+                DemuxedState::Pulling(stream_id) => (*stream_id, None),
+                DemuxedState::Fused => return Poll::Ready(None),
+            };
+            let session = this.session.as_mut().project();
+            let playing = session.state.project();
+            let depacketizer = match &mut playing.presentation.streams[stream_id].depacketizer {
+                Ok(d) => d,
+                Err(_) => unreachable!("depacketizer was Ok"),
+            };
+            let conn_ctx = session.conn.inner.ctx();
+            if let Some(p) = pkt {
+                let msg_ctx = p.ctx;
+                let channel_id = p.channel_id;
+                let stream_id = p.stream_id;
+                let ssrc = p.ssrc;
+                let sequence_number = p.sequence_number;
+                depacketizer.push(p).map_err(|description| {
+                    wrap!(ErrorInt::RtpPacketError {
+                        conn_ctx: *conn_ctx,
+                        msg_ctx,
+                        channel_id,
+                        stream_id,
+                        ssrc,
+                        sequence_number,
+                        description,
+                    })
+                })?;
+            }
+            match depacketizer.pull(conn_ctx) {
+                Ok(Some(item)) => {
+                    *this.state = DemuxedState::Pulling(stream_id);
+                    return Poll::Ready(Some(Ok(item)));
+                }
+                Ok(None) => {
+                    *this.state = DemuxedState::Waiting;
+                    continue;
+                }
+                Err(e) => {
+                    *this.state = DemuxedState::Fused;
+                    return Poll::Ready(Some(Err(e)));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::response;
+
+    /// Cross-platform, tokio equivalent of `socketpair(2)`.
+    async fn socketpair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        // Another process on the machine could connect to the server and mess
+        // this up, but that's unlikely enough to ignore in test code.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr);
+        let server = listener.accept();
+        (client.await.unwrap(), server.await.unwrap().0)
+    }
+
+    async fn connect_to_mock(
+        options: SessionOptions,
+    ) -> (RtspConnection, crate::tokio::Connection) {
+        let (client, server) = socketpair().await;
+        let client = crate::tokio::Connection::from_stream(client).unwrap();
+        let server = crate::tokio::Connection::from_stream(server).unwrap();
+        let client = RtspConnection {
+            inner: client,
+            options,
+            requested_auth: None,
+            next_cseq: 1,
+        };
+        (client, server)
+    }
+
+    /// Receives a request and sends a reply, filling in the matching `CSeq`.
+    async fn req_reply(
+        server: &mut crate::tokio::Connection,
+        expected_method: rtsp_types::Method,
+        mut response: rtsp_types::Response<Bytes>,
+    ) {
+        let msg = server.next().await.unwrap().unwrap();
+        let cseq = match msg.msg {
+            rtsp_types::Message::Request(ref r) => {
+                assert_eq!(r.method(), expected_method);
+                r.header(&rtsp_types::headers::CSEQ).unwrap()
+            }
+            _ => panic!(),
+        };
+        response.insert_header(rtsp_types::headers::CSEQ, cseq.as_str());
+        server
+            .send(rtsp_types::Message::Response(response))
+            .await
+            .unwrap();
+    }
+
+    /// Test the happy path of session initialization.
+    #[tokio::test]
+    async fn simple() {
+        let (conn, mut server) = connect_to_mock(SessionOptions::default()).await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+
+        // DESCRIBE.
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(conn, url),
+            req_reply(
+                &mut server,
+                rtsp_types::Method::Describe,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        assert_eq!(session.streams().len(), 2);
+
+        // SETUP.
+        tokio::join!(
+            async {
+                session.setup(0).await.unwrap();
+            },
+            req_reply(
+                &mut server,
+                rtsp_types::Method::Setup,
+                response(include_bytes!("testdata/reolink_setup.txt"))
+            ),
+        );
+
+        // PLAY.
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_reply(
+                &mut server,
+                rtsp_types::Method::Play,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        let session = session.unwrap();
+        tokio::pin!(session);
+
+        // Packet.
+        tokio::join!(
+            async {
+                match session.next().await {
+                    Some(Ok(PacketItem::RtpPacket(p))) => {
+                        assert_eq!(p.ssrc, 0xdcc4a0d8);
+                        assert_eq!(p.sequence_number, 0x41d4);
+                        assert_eq!(&p.payload[..], b"hello world");
+                    }
+                    o => panic!("unexpected item: {:#?}", o),
+                }
+            },
+            async {
+                let pkt = b"\x80\x60\x41\xd4\x00\x00\x00\x00\xdc\xc4\xa0\xd8hello world";
+                server
+                    .send(rtsp_types::Message::Data(rtsp_types::Data::new(
+                        0,
+                        Bytes::from_static(pkt),
+                    )))
+                    .await
+                    .unwrap();
+            },
+        );
+
+        // End of stream.
+        tokio::join!(
+            async {
+                assert!(session.next().await.is_none());
+            },
+            async {
+                server.close().await.unwrap();
+            },
+        );
+    }
+
+    /// Tests the `ignore_spurious_data` feature:
+    /// *   ignore a data packet while waiting for a RTSP response early on.
+    /// *   ignore a data packet with the wrong ssrc after play.
+    #[tokio::test]
+    async fn ignore_spurious_data() {
+        let (conn, mut server) =
+            connect_to_mock(SessionOptions::default().ignore_spurious_data(true)).await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+        let bogus_pkt = rtsp_types::Message::Data(rtsp_types::Data::new(
+            0,
+            Bytes::from_static(b"\x80\x60\xaa\xaa\x00\x00\x00\x00\xbb\xbb\xbb\xbbbogus pkt"),
+        ));
+
+        // DESCRIBE.
+        let (session, _) = tokio::join!(Session::describe_with_conn(conn, url), async {
+            server.send(bogus_pkt.clone()).await.unwrap();
+            req_reply(
+                &mut server,
+                rtsp_types::Method::Describe,
+                response(include_bytes!("testdata/reolink_describe.txt")),
+            )
+            .await;
+        },);
+        let mut session = session.unwrap();
+        assert_eq!(session.streams().len(), 2);
+
+        // SETUP.
+        tokio::join!(
+            async {
+                session.setup(0).await.unwrap();
+            },
+            req_reply(
+                &mut server,
+                rtsp_types::Method::Setup,
+                response(include_bytes!("testdata/reolink_setup.txt"))
+            ),
+        );
+
+        // PLAY.
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_reply(
+                &mut server,
+                rtsp_types::Method::Play,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        let session = session.unwrap();
+        tokio::pin!(session);
+
+        // Packet.
+        tokio::join!(
+            async {
+                match session.next().await {
+                    Some(Ok(PacketItem::RtpPacket(p))) => {
+                        assert_eq!(p.ssrc, 0xdcc4a0d8);
+                        assert_eq!(p.sequence_number, 0x41d4);
+                        assert_eq!(&p.payload[..], b"hello world");
+                    }
+                    o => panic!("unexpected item: {:#?}", o),
+                }
+            },
+            async {
+                server.send(bogus_pkt).await.unwrap();
+                let pkt = b"\x80\x60\x41\xd4\x00\x00\x00\x00\xdc\xc4\xa0\xd8hello world";
+                server
+                    .send(rtsp_types::Message::Data(rtsp_types::Data::new(
+                        0,
+                        Bytes::from_static(pkt),
+                    )))
+                    .await
+                    .unwrap();
+            },
+        );
+
+        // End of stream.
+        tokio::join!(
+            async {
+                assert!(session.next().await.is_none());
+            },
+            async {
+                server.close().await.unwrap();
+            },
+        );
+    }
+
+    // See with: cargo test -- --nocapture client::tests::print_sizes
+    #[test]
+    fn print_sizes() {
+        for (name, size) in &[
+            ("RtspConnection", std::mem::size_of::<RtspConnection>()),
+            (
+                "Session<Described>",
+                std::mem::size_of::<Session<Described>>(),
+            ),
+            ("Session<Playing>", std::mem::size_of::<Session<Playing>>()),
+            ("Demuxed", std::mem::size_of::<Demuxed>()),
+            ("Stream", std::mem::size_of::<Stream>()),
+            ("PacketItem", std::mem::size_of::<PacketItem>()),
+            ("rtp::Packet", std::mem::size_of::<rtp::Packet>()),
+            (
+                "rtp::SenderReport",
+                std::mem::size_of::<rtp::SenderReport>(),
+            ),
+        ] {
+            println!("{:-40} {:4}", name, size);
+        }
     }
 }
