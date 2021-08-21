@@ -15,8 +15,8 @@ Progress:
     *   [x] digest authentication.
     *   [x] RTP over TCP via RTSP interleaved channels.
     *   [ ] RTP over UDP.
-    *   [x] RTSP/1.0.
-    *   [ ] RTSP/2.0.
+    *   [x] [RTSP/1.0](https://datatracker.ietf.org/doc/html/rfc2326).
+    *   [ ] [RTSP/2.0](https://datatracker.ietf.org/doc/html/rfc7826).
     *   [ ] SRTP.
     *   [ ] ONVIF backchannel support (for sending audio).
     *   [ ] ONVIF replay mode.
